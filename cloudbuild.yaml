@@ -1,0 +1,70 @@
+# Cloud Build pipeline: build image -> push to GCR -> deploy to Cloud Run
+# Service name: gemini-call-link
+#
+# REQUIRED one-time setup:
+#   1. Enable APIs: Cloud Build, Cloud Run, Container Registry
+#        gcloud services enable cloudbuild.googleapis.com run.googleapis.com containerregistry.googleapis.com
+#   2. Grant the Cloud Build service account permission to deploy to Cloud Run:
+#        PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')
+#        gcloud projects add-iam-policy-binding $PROJECT_ID \
+#          --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
+#          --role="roles/run.admin"
+#        gcloud iam service-accounts add-iam-policy-binding \
+#          $(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')-compute@developer.gserviceaccount.com \
+#          --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
+#          --role="roles/iam.serviceAccountUser"
+#   3. Set runtime secrets (NEVER bake them into the image). Either add
+#      --set-secrets below, or configure them once in the console / CLI:
+#        gcloud run services update gemini-call-link --region=${_REGION} \
+#          --set-secrets=GEMINI_API_KEY=gemini-api-key:latest,META_ACCESS_TOKEN=meta-token:latest
+#
+# Trigger with:  gcloud builds submit --config cloudbuild.yaml .
+# Or connect the repo in Cloud Console -> Cloud Build -> Triggers (builds on every push).
+
+steps:
+  # 1. Build the container image (tagged with commit SHA + latest)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/gemini-call-link:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/gemini-call-link:latest'
+      - '.'
+    timeout: 600s
+
+  # 2. Push both tags to Google Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/gemini-call-link:$COMMIT_SHA']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/gemini-call-link:latest']
+
+  # 3. Deploy the SHA-tagged image to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'gemini-call-link'
+      - '--image=gcr.io/$PROJECT_ID/gemini-call-link:$COMMIT_SHA'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--port=8080'
+      - '--cpu=1'
+      - '--memory=1Gi'
+      - '--timeout=300' # max request timeout; keeps long-lived call WebSockets alive
+      - '--max-instances=10'
+      - '--set-env-vars=NODE_ENV=production'
+    # To inject secrets at deploy time, add e.g.:
+    # - '--set-secrets=GEMINI_API_KEY=gemini-api-key:latest'
+
+substitutions:
+  _REGION: asia-south1 # override per-build: gcloud builds submit --substitutions=_REGION=us-central1
+
+timeout: 1200s
+
+# Registers pushed images in the build record
+images:
+  - 'gcr.io/$PROJECT_ID/gemini-call-link:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/gemini-call-link:latest'
