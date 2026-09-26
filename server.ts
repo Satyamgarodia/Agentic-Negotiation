@@ -1,10 +1,11 @@
 import express, { Request, Response } from 'express';
 import http from 'http';
 import path from 'path';
+import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality } from '@google/genai';
 import dotenv from 'dotenv';
-import { ConnectorClient } from 'livekit-server-sdk';
+import { RoomServiceClient, AccessToken } from 'livekit-server-sdk';
 
 dotenv.config();
 
@@ -12,17 +13,40 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
-// LiveKit Cloud Configuration
-const livekitUrl = process.env.LIVEKIT_URL || 'wss://agent-negotiation-wt32uzjo.livekit.cloud';
-const livekitApiKey = process.env.LIVEKIT_API_KEY || 'API6QmR77yuXpVF';
-const livekitApiSecret = process.env.LIVEKIT_API_SECRET || 'MjYVsQxNWPZoK1mLBWtOcVIu22GR3TkuKsFxpcDu41F';
+// ---------------------------------------------------------------------------
+// Config: ONLY secrets come from env. Everything else is hardcoded below so
+// the Cloud Run env panel stays minimal (4 vars). Deployment-specific values
+// still honor env overrides if ever set, but work hardcoded out of the box.
+// Required env: GEMINI_API_KEY, META_ACCESS_TOKEN, LIVEKIT_API_KEY,
+// LIVEKIT_API_SECRET. (PORT is injected by Cloud Run.)
+// ---------------------------------------------------------------------------
+const GEMINI_LIVE_MODEL = 'gemini-3.8-live';
+const GEMINI_LIVE_FALLBACK_MODEL = 'gemini-2.5-flash-native-audio-preview-09-2025';
+const GEMINI_VOICE_DEFAULT = 'Zephyr';
+const META_GRAPH_VERSION = 'v21.0';
+// Public IPv4 announced inside the SDP answer. MUST be reachable over UDP for
+// WhatsApp RTP. On Cloud Run there is no UDP ingress, so point this at your
+// LiveKit Cloud TURN / media-bridge host. Never 127.0.0.1.
+const MEDIA_ANNOUNCE_IP = process.env.MEDIA_ANNOUNCE_IP || '';
+const MEDIA_PORT = 3480;
+const PUBLIC_BASE_URL = (process.env.APP_URL || 'https://gemini-call-link-387274718809.asia-southeast1.run.app').replace(/\/$/, '');
 
-let livekitConnector: ConnectorClient | null = null;
-try {
-  livekitConnector = new ConnectorClient(livekitUrl, livekitApiKey, livekitApiSecret);
-  console.log('[LiveKit Cloud] Connector initialized with endpoint:', livekitUrl);
-} catch (e) {
-  console.error('[LiveKit Cloud] Failed to initialize ConnectorClient:', e);
+const livekitUrl = process.env.LIVEKIT_URL || 'wss://agent-negotiation-wt32uzjo.livekit.cloud';
+const livekitApiKey = process.env.LIVEKIT_API_KEY || '';
+const livekitApiSecret = process.env.LIVEKIT_API_SECRET || '';
+const livekitConfigured = Boolean(livekitUrl && livekitApiKey && livekitApiSecret);
+
+let roomService: RoomServiceClient | null = null;
+if (livekitConfigured) {
+  try {
+    roomService = new RoomServiceClient(livekitUrl, livekitApiKey, livekitApiSecret);
+    console.log('[LiveKit] RoomServiceClient initialized:', livekitUrl);
+  } catch (e) {
+    console.error('[LiveKit] Failed to initialize RoomServiceClient:', e);
+    roomService = null;
+  }
+} else {
+  console.warn('[LiveKit] LIVEKIT_URL / API_KEY / API_SECRET not fully set — rooms/tokens disabled, direct Gemini bridge still works.');
 }
 
 app.use(express.json());
@@ -58,9 +82,9 @@ let gatewayConfig: GatewayConfig = {
   wabaId: '239559819251204',
   businessPhoneNumber: '+91 82877 26383',
   verifyToken: 'whatsapp_gemini_verify_token_live',
-  metaAccessToken: process.env.META_ACCESS_TOKEN || 'EAAE2FEOgZBCUBO5ZAmWlFybw7gjNDLCQsjdy8DAkUDFa3nzwc6ZBFtBK01tvNzjfYx3t1oMe0PdZAejBo9q4zC4A9KdJgpQzvZBpErOKjGBcKtxK0ju0ZCihMUwYKsn7umrQ4RpiL94tWvySrMvHH8l4BT762yZBrb6HzFK3xYmjEZB087ZC2sDlrZCwABVpSUKpco6iIXps8ZA3ugZCrL2I',
+  metaAccessToken: process.env.META_ACCESS_TOKEN || '',
   autoAcceptCalls: true,
-  voiceName: 'Zephyr',
+  voiceName: GEMINI_VOICE_DEFAULT,
   personaName: 'WhatsApp Business AI Assistant',
   systemPrompt: `You are the official voice assistant for WhatsApp Business. You answer voice calls live from customers with exceptional clarity, empathy, and conciseness.
 Keep your spoken responses natural, conversational, and direct (1-3 sentences per turn). Do not use markdown, emojis, or bullet points in voice responses.
@@ -82,6 +106,8 @@ export interface CallSession {
   packetsOut: number;
   avgLatencyMs: number;
   interruptionsCount: number;
+  livekitRoom?: string;
+  geminiConnected?: boolean;
   turns: Array<{
     speaker: 'caller' | 'gemini';
     text: string;
@@ -91,6 +117,13 @@ export interface CallSession {
 
 // In-memory call log
 const callSessions: Map<string, CallSession> = new Map();
+// Server-side Gemini Live sessions keyed by callId — this is the DIRECT bridge.
+// No browser click required: webhook -> LiveKit room -> Gemini Live session.
+const geminiSessions: Map<string, any> = new Map();
+// Latest Gemini output audio (base64 PCM 24k) queued per call for media bridges.
+const geminiAudioOutbox: Map<string, string[]> = new Map();
+// LiveKit room info per call.
+const livekitRooms: Map<string, { roomName: string; agentToken: string; callerToken: string }> = new Map();
 const recentCalls: CallSession[] = [
   {
     id: 'call_seed_1',
@@ -160,6 +193,535 @@ function resampleMulawToPCM16(mulawBuffer: Buffer): Buffer {
   return outBuffer;
 }
 
+// Linear PCM 16-bit sample -> μ-law byte (for Twilio/media-bridge playback)
+function linearToMulaw(sample: number): number {
+  const MU_LAW_MAX = 32124;
+  const BIAS = 0x84;
+  let s = Math.max(-MU_LAW_MAX, Math.min(MU_LAW_MAX, sample));
+  const sign = s < 0 ? 0x80 : 0x00;
+  if (s < 0) s = -s;
+  s += BIAS;
+  let exponent = 7;
+  for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; expMask >>= 1) {
+    exponent--;
+  }
+  const mantissa = (s >> (exponent + 3)) & 0x0f;
+  return ~(sign | (exponent << 4) | mantissa) & 0xff;
+}
+
+// Downsample 24kHz PCM16 -> 8kHz μ-law (Gemini output -> telephony)
+function resamplePCM24kToMulaw8k(pcm24kBase64: string): Buffer {
+  const raw = Buffer.from(pcm24kBase64, 'base64');
+  const sampleCount = Math.floor(raw.length / 2);
+  const out: number[] = [];
+  for (let i = 0; i < sampleCount; i += 3) {
+    out.push(linearToMulaw(raw.readInt16LE(i * 2)));
+  }
+  return Buffer.from(out);
+}
+
+// ---------------------------------------------------------------------------
+// LiveKit room orchestration (real SDK: RoomServiceClient + AccessToken)
+// Each WhatsApp call gets its own room: wa_<callId>. The Gemini bridge agent
+// and any media-bridge worker join with the minted tokens (TCP/TLS — works
+// from Cloud Run, unlike raw UDP/RTP).
+// ---------------------------------------------------------------------------
+async function ensureLiveKitRoom(callId: string, callerName: string) {
+  const cached = livekitRooms.get(callId);
+  if (cached) return cached;
+  if (!roomService || !livekitConfigured) return null;
+
+  const roomName = `wa_${callId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100)}`;
+  try {
+    try {
+      await roomService.createRoom({ name: roomName, emptyTimeout: 10 * 60, maxParticipants: 10 });
+    } catch (e: any) {
+      // Room already exists — fine, reuse it.
+      if (!String(e?.message || e).toLowerCase().includes('exist')) throw e;
+    }
+
+    const mint = async (identity: string, name: string) => {
+      const token = new AccessToken(livekitApiKey, livekitApiSecret, {
+        identity,
+        name,
+        ttl: '2h',
+      });
+      token.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true, canPublishData: true });
+      return await token.toJwt();
+    };
+
+    const info = {
+      roomName,
+      agentToken: await mint(`agent_${callId}`.slice(0, 100), 'Gemini Voice Agent'),
+      callerToken: await mint(`caller_${callId}`.slice(0, 100), callerName),
+    };
+    livekitRooms.set(callId, info);
+    console.log(`[LiveKit] Room ready: ${roomName} for call ${callId}`);
+    return info;
+  } catch (e) {
+    console.error('[LiveKit] Room setup failed:', e);
+    return null;
+  }
+}
+
+function livekitWsUrl(): string {
+  // Convert wss://host / https://host to https://host for token endpoint hints.
+  return livekitUrl;
+}
+
+// ---------------------------------------------------------------------------
+// Server-side Gemini Live session per call (the DIRECT connect).
+// Audio in:  PCM 16kHz base64 via sendRealtimeInput.
+// Audio out: PCM 24kHz base64 -> media bridges + dashboard monitors.
+// ---------------------------------------------------------------------------
+function buildGeminiTools() {
+  return [
+    {
+      functionDeclarations: [
+        {
+          name: 'check_order_status',
+          description: 'Look up a WhatsApp order shipping status by order ID.',
+          parameters: { type: 'OBJECT' as any, properties: { orderId: { type: 'STRING' as any } } },
+        },
+        {
+          name: 'book_appointment',
+          description: 'Book an appointment for the caller.',
+          parameters: {
+            type: 'OBJECT' as any,
+            properties: { date: { type: 'STRING' as any }, time: { type: 'STRING' as any } },
+          },
+        },
+        {
+          name: 'get_business_hours',
+          description: 'Get branch opening hours.',
+          parameters: { type: 'OBJECT' as any, properties: {} },
+        },
+        {
+          name: 'escalate_to_human',
+          description: 'Create a priority ticket and escalate to a human agent.',
+          parameters: {
+            type: 'OBJECT' as any,
+            properties: { reason: { type: 'STRING' as any } },
+          },
+        },
+      ],
+    },
+  ];
+}
+
+function resolveToolResult(name: string, args: any) {
+  if (name === 'check_order_status') {
+    return {
+      orderId: args?.orderId || 'WA-8921',
+      status: 'Shipped',
+      carrier: 'FedEx Priority',
+      estimatedDelivery: 'Tomorrow, 2:30 PM',
+      items: ['Wireless Noise Cancelling Earbuds Pro', 'USB-C Braided Cable 2m'],
+    };
+  }
+  if (name === 'book_appointment') {
+    return {
+      appointmentId: `APT-${Math.floor(1000 + Math.random() * 9000)}`,
+      date: args?.date || 'Tomorrow',
+      time: args?.time || '11:00 AM',
+      confirmed: true,
+      confirmationSentViaWhatsApp: true,
+    };
+  }
+  if (name === 'get_business_hours') {
+    return { mondayToFriday: '8:00 AM - 8:00 PM EST', saturday: '9:00 AM - 5:00 PM EST', sunday: 'Closed' };
+  }
+  if (name === 'escalate_to_human') {
+    return { ticketCreated: true, queuePosition: 2, estimatedWaitMinutes: 3 };
+  }
+  return { status: 'ok' };
+}
+
+async function startGeminiLiveForCall(callId: string): Promise<boolean> {
+  if (geminiSessions.has(callId)) return true;
+  const call = callSessions.get(callId);
+  if (!call) return false;
+
+  if (!apiKey) {
+    console.error('[Gemini Live] GEMINI_API_KEY missing — cannot auto-answer call', callId);
+    notifySockets({ type: 'live_error', callId, error: 'GEMINI_API_KEY missing on server' });
+    return false;
+  }
+
+  const modelsToTry = [GEMINI_LIVE_MODEL, GEMINI_LIVE_FALLBACK_MODEL].filter((m, i, arr) => m && arr.indexOf(m) === i);
+
+  for (const model of modelsToTry) {
+    try {
+      console.log(`[Gemini Live] Connecting model ${model} for call ${callId}...`);
+      notifySockets({ type: 'live_status', callId, status: 'connecting', message: `Initializing ${model}...` });
+
+      const session = await ai.live.connect({
+        model,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: gatewayConfig.voiceName } },
+          },
+          systemInstruction: gatewayConfig.systemPrompt,
+          tools: buildGeminiTools() as any,
+        } as any,
+        callbacks: {
+          onopen: () => {
+            console.log(`[Gemini Live] Session open for call ${callId} (${model})`);
+            call.geminiConnected = true;
+            if (call.status === 'ringing') call.status = 'connected';
+            notifySockets({ type: 'live_status', callId, status: 'connected', message: `${model} connected and listening.`, model });
+            notifySockets({ type: 'call_connected_meta', callId, roomName: call.livekitRoom || `wa_${callId}`, model });
+          },
+          onmessage: (message: any) => {
+            const parts = message.serverContent?.modelTurn?.parts;
+            if (parts && parts.length > 0) {
+              for (const part of parts) {
+                if (part.inlineData?.data) {
+                  const queue = geminiAudioOutbox.get(callId) || [];
+                  queue.push(part.inlineData.data);
+                  geminiAudioOutbox.set(callId, queue);
+                  // Fan out to dashboard monitors + media bridges.
+                  notifySockets({
+                    type: 'audio_chunk',
+                    callId,
+                    audio: part.inlineData.data,
+                    mimeType: part.inlineData.mimeType || 'audio/pcm;rate=24000',
+                  });
+                  flushGeminiAudioToBridges(callId);
+                }
+                if (part.text) {
+                  call.turns.push({ speaker: 'gemini', text: part.text, timestamp: new Date().toISOString() });
+                  notifySockets({ type: 'transcript_chunk', callId, speaker: 'gemini', text: part.text });
+                }
+              }
+            }
+            if (message.serverContent?.interrupted) {
+              call.status = 'interrupted';
+              call.interruptionsCount += 1;
+              notifySockets({ type: 'interrupted', callId, message: 'Gemini output halted by caller speech' });
+              setTimeout(() => {
+                if (call.status === 'interrupted') call.status = 'connected';
+              }, 800);
+            }
+            if (message.toolCall) {
+              const calls = message.toolCall.functionCalls || [];
+              const responses = calls.map((toolCall: any) => {
+                const result = resolveToolResult(toolCall.name, toolCall.args);
+                call.turns.push({
+                  speaker: 'gemini',
+                  text: `[Action: ${toolCall.name}] -> ${JSON.stringify(result)}`,
+                  timestamp: new Date().toISOString(),
+                });
+                notifySockets({ type: 'function_executed', callId, name: toolCall.name, args: toolCall.args, result });
+                return { id: toolCall.id, name: toolCall.name, response: { result } };
+              });
+              try {
+                (session as any)?.sendToolResponse?.({ functionResponses: responses });
+              } catch (e) {
+                console.warn('[Gemini Live] sendToolResponse failed:', e);
+              }
+            }
+          },
+          onerror: (err: any) => {
+            console.error(`[Gemini Live Error] call ${callId}:`, err?.message || err);
+            notifySockets({ type: 'live_error', callId, error: err?.message || 'Gemini Live session error' });
+          },
+          onclose: (e: any) => {
+            console.log(`[Gemini Live] Session closed for call ${callId}:`, e?.reason || 'Normal close');
+            geminiSessions.delete(callId);
+            if (call.geminiConnected) {
+              call.geminiConnected = false;
+              notifySockets({ type: 'live_status', callId, status: 'disconnected', message: 'Gemini Live session disconnected' });
+            }
+          },
+        },
+      });
+
+      geminiSessions.set(callId, session);
+
+      // Auto-greet the real caller the moment the line is answered.
+      try {
+        (session as any)?.sendClientContent?.({
+          turns: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: `A WhatsApp voice call just connected from ${call.callerName} (${call.callerNumber}). You are ${gatewayConfig.personaName}. Greet them warmly by name and offer your assistance in 1-2 short sentences.`,
+                },
+              ],
+            },
+          ],
+          turnComplete: true,
+        });
+      } catch (e) {
+        console.warn('[Gemini Live] greeting send failed:', e);
+      }
+
+      console.log(`[Gemini Live] Session established for call ${callId} (${model})`);
+      return true;
+    } catch (err: any) {
+      console.error(`[Gemini Live] Connect failed for model ${model}:`, err?.message || err);
+      notifySockets({ type: 'live_error', callId, model, error: err?.message || `Failed to connect ${model}` });
+    }
+  }
+  return false;
+}
+
+function sendAudioToGemini(callId: string, pcm16kBase64: string) {
+  const session = geminiSessions.get(callId);
+  if (!session) return false;
+  try {
+    try {
+      session.sendRealtimeInput({ audio: { data: pcm16kBase64, mimeType: 'audio/pcm;rate=16000' } });
+    } catch {
+      session.sendRealtimeInput({ mediaChunks: [{ data: pcm16kBase64, mimeType: 'audio/pcm;rate=16000' }] });
+    }
+    const call = callSessions.get(callId);
+    if (call) {
+      call.packetsIn += 1;
+      if (call.status === 'connected') call.status = 'speaking';
+    }
+    return true;
+  } catch (e) {
+    console.warn('[Gemini Live] sendRealtimeInput failed:', e);
+    return false;
+  }
+}
+
+function closeGeminiSession(callId: string) {
+  const session = geminiSessions.get(callId);
+  geminiSessions.delete(callId);
+  geminiAudioOutbox.delete(callId);
+  if (session) {
+    try {
+      if (typeof session.close === 'function') session.close();
+      else if (session.conn?.close) session.conn.close();
+    } catch { /* ignore */ }
+  }
+}
+
+// Media bridges (Twilio / LiveKit agent worker / SIP gateway) subscribe here.
+const callMediaBridges: Map<string, Set<WebSocket>> = new Map();
+
+function flushGeminiAudioToBridges(callId: string) {
+  const bridges = callMediaBridges.get(callId);
+  if (!bridges || bridges.size === 0) return;
+  const queue = geminiAudioOutbox.get(callId);
+  if (!queue || queue.length === 0) return;
+  geminiAudioOutbox.set(callId, []);
+
+  for (const client of bridges) {
+    if (client.readyState !== WebSocket.OPEN) continue;
+    const kind = (client as any).__bridgeKind || 'raw';
+    for (const pcm24 of queue) {
+      try {
+        if (kind === 'twilio') {
+          // Twilio expects 8kHz μ-law frames (~20ms each).
+          const mulaw = resamplePCM24kToMulaw8k(pcm24);
+          const streamSid = (client as any).__streamSid || '';
+          for (let i = 0; i < mulaw.length; i += 160) {
+            client.send(JSON.stringify({
+              event: 'media',
+              streamSid,
+              media: { payload: mulaw.subarray(i, i + 160).toString('base64') },
+            }));
+          }
+        } else {
+          client.send(JSON.stringify({ type: 'gemini_audio', callId, audio: pcm24, mimeType: 'audio/pcm;rate=24000' }));
+        }
+      } catch { /* ignore per-bridge errors */ }
+    }
+  }
+  const call = callSessions.get(callId);
+  if (call) call.packetsOut += queue.length;
+}
+
+// ---------------------------------------------------------------------------
+// Meta WhatsApp Cloud API: accept the call (signaling = HTTPS, works on
+// Cloud Run). Respond 200 to the webhook FIRST, then run this async.
+// ---------------------------------------------------------------------------
+function generateSdpAnswer(offerSdp: string): string {
+  const payloadMatch = offerSdp.match(/m=audio\s+\d+\s+\S+\s+([\d\s]+)/);
+  const payloads = payloadMatch ? payloadMatch[1].trim().split(/\s+/) : ['111'];
+  const opusPayload = payloads.includes('111') ? '111' : payloads[0] || '111';
+  const midMatch = offerSdp.match(/a=mid:([^\r\n]+)/);
+  const mid = midMatch ? midMatch[1].trim() : 'audio';
+
+  const announceIp = MEDIA_ANNOUNCE_IP || '0.0.0.0';
+  if (!MEDIA_ANNOUNCE_IP) {
+    console.warn('[SDP] MEDIA_ANNOUNCE_IP not set — answering with 0.0.0.0. Set it to your LiveKit/media-bridge public IP or calls will not carry audio.');
+  }
+
+  const ufrag = crypto.randomBytes(4).toString('hex');
+  const pwd = crypto.randomBytes(14).toString('base64').replace(/[^a-zA-Z0-9]/g, 'X');
+  const fingerprint =
+    process.env.MEDIA_DTLS_FINGERPRINT ||
+    '73:F2:08:6C:27:99:83:66:45:35:F9:06:C9:AC:47:6D:31:83:41:85:A4:FC:72:06:E4:CC:44:8D:52:CB:35:DA';
+
+  return [
+    'v=0',
+    `o=- ${Date.now()} 2 IN IP4 ${announceIp}`,
+    's=WhatsAppGeminiLive',
+    't=0 0',
+    'a=msid-semantic: WMS WhatsAppGeminiLive',
+    `m=audio ${MEDIA_PORT} UDP/TLS/RTP/SAVPF ${opusPayload}`,
+    `c=IN IP4 ${announceIp}`,
+    'a=rtcp:9 IN IP4 0.0.0.0',
+    `a=ice-ufrag:${ufrag}`,
+    `a=ice-pwd:${pwd}`,
+    `a=fingerprint:sha-256 ${fingerprint}`,
+    'a=setup:active',
+    `a=mid:${mid}`,
+    'a=sendrecv',
+    'a=rtcp-mux',
+    `a=rtpmap:${opusPayload} opus/48000/2`,
+    `a=fmtp:${opusPayload} maxaveragebitrate=20000;maxplaybackrate=16000;minptime=20;sprop-maxcapturerate=16000;useinbandfec=1`,
+    'a=ptime:20',
+    `a=candidate:1 1 udp 2130706431 ${announceIp} ${MEDIA_PORT} typ host`,
+    '',
+  ].join('\r\n');
+}
+
+async function acceptMetaCall(
+  callId: string,
+  phoneNumberId: string,
+  sdpOffer: string,
+  token: string,
+): Promise<string> {
+  const sdpAnswer = generateSdpAnswer(sdpOffer);
+  const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${phoneNumberId}/calls`;
+  console.log(`[Meta Cloud API] Accepting WhatsApp call ${callId} via ${url} ...`);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      call_id: callId,
+      action: 'accept',
+      session: { sdp_type: 'answer', sdp: sdpAnswer },
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  console.log('[Meta Cloud API] Accept response:', JSON.stringify(data));
+  if (res.ok && (data as any).success !== false && !(data as any).error) {
+    return 'accepted_via_graph_api';
+  }
+  return `meta_error: ${(data as any)?.error?.message || JSON.stringify(data)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Core pickup pipeline: register -> LiveKit room -> Gemini Live -> Meta accept
+// ---------------------------------------------------------------------------
+async function processIncomingCall(opts: {
+  callId: string;
+  caller: string;
+  callerName: string;
+  sdpOffer: string;
+  phoneNumberId: string;
+}) {
+  const { callId, caller, callerName, sdpOffer, phoneNumberId } = opts;
+
+  let call = callSessions.get(callId);
+  if (!call) {
+    call = {
+      id: callId,
+      callerNumber: caller,
+      callerName,
+      direction: 'inbound',
+      status: 'ringing',
+      startedAt: new Date().toISOString(),
+      durationSeconds: 0,
+      packetsIn: 0,
+      packetsOut: 0,
+      avgLatencyMs: 0,
+      interruptionsCount: 0,
+      turns: [],
+    };
+    callSessions.set(callId, call);
+  }
+
+  // 1. LiveKit room for this call (media gateway orchestration over TCP/TLS).
+  const room = await ensureLiveKitRoom(callId, callerName);
+  if (room) {
+    call.livekitRoom = room.roomName;
+  }
+
+  notifySockets({
+    type: 'incoming_call_event',
+    call,
+    hasSdpOffer: Boolean(sdpOffer),
+    livekitRoom: room?.roomName || null,
+    livekitUrl: livekitConfigured ? livekitWsUrl() : null,
+    agentToken: room?.agentToken || null,
+  });
+
+  if (!gatewayConfig.autoAcceptCalls) {
+    console.log(`[Pickup] autoAcceptCalls=off — call ${callId} left ringing for manual accept.`);
+    return { acceptStatus: 'manual_accept_required', roomName: room?.roomName || null };
+  }
+
+  // 2. DIRECT connect: Gemini Live session starts NOW — no browser click.
+  const geminiOk = await startGeminiLiveForCall(callId);
+
+  // 3. Signaling accept toward Meta (needs token + SDP offer).
+  const token = gatewayConfig.metaAccessToken || process.env.META_ACCESS_TOKEN || '';
+  let acceptStatus = 'waiting_for_media_bridge';
+  if (token && sdpOffer && phoneNumberId) {
+    try {
+      acceptStatus = await acceptMetaCall(callId, phoneNumberId, sdpOffer, token);
+      if (acceptStatus.startsWith('accepted')) {
+        call.status = 'connected';
+      }
+    } catch (err: any) {
+      console.error('[Meta Cloud API] Accept failed:', err?.message || err);
+      acceptStatus = `exception: ${err?.message || err}`;
+    }
+  } else if (!token) {
+    acceptStatus = 'missing_meta_token';
+    console.warn('[Pickup] META_ACCESS_TOKEN missing — signaling accept skipped. Gemini session is live; add token to auto-answer Meta-side ringing.');
+  } else if (!sdpOffer) {
+    acceptStatus = 'no_sdp_offer_in_webhook';
+    console.warn('[Pickup] Webhook had no SDP offer — Gemini session is live; media bridge / Twilio path can still carry audio.');
+  }
+
+  notifySockets({
+    type: 'call_connected_meta',
+    callId,
+    roomName: room?.roomName || `wa_${callId}`,
+    acceptStatus,
+    geminiConnected: geminiOk,
+  });
+
+  console.log(`[Pickup] call=${callId} gemini=${geminiOk ? 'connected' : 'FAILED'} accept=${acceptStatus}`);
+  return { acceptStatus, roomName: room?.roomName || null, geminiConnected: geminiOk };
+}
+
+function endCall(callId: string, reason = 'ended') {
+  const call = callSessions.get(callId);
+  if (call) {
+    call.status = 'ended';
+    call.endedAt = new Date().toISOString();
+    recentCalls.unshift({ ...call });
+    callSessions.delete(callId);
+  }
+  closeGeminiSession(callId);
+  const bridges = callMediaBridges.get(callId);
+  if (bridges) {
+    for (const ws of bridges) {
+      try { ws.close(); } catch { /* ignore */ }
+    }
+    callMediaBridges.delete(callId);
+  }
+  const room = livekitRooms.get(callId);
+  if (room && roomService) {
+    roomService.deleteRoom(room.roomName).catch(() => {});
+    livekitRooms.delete(callId);
+  }
+  notifySockets({ type: 'call_ended', callId, reason });
+}
+
 // REST API Endpoints
 
 // 1. Health & Server Status
@@ -168,8 +730,12 @@ app.get('/api/health', (req: Request, res: Response) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     hasApiKey: Boolean(apiKey),
-    model: 'gemini-3.8-live',
+    model: GEMINI_LIVE_MODEL,
+    livekitConfigured,
+    autoAccept: gatewayConfig.autoAcceptCalls,
+    mediaAnnounceIp: MEDIA_ANNOUNCE_IP || null,
     activeCalls: Array.from(callSessions.values()).filter((c) => c.status !== 'ended').length,
+    activeGeminiSessions: geminiSessions.size,
   });
 });
 
@@ -178,12 +744,13 @@ app.get('/api/whatsapp/config', (req: Request, res: Response) => {
   const host = req.get('host') || 'localhost:3000';
   const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
   const wsProtocol = protocol === 'https' ? 'wss' : 'ws';
+  const base = PUBLIC_BASE_URL || `${protocol}://${host}`;
 
   res.json({
-    config: gatewayConfig,
+    config: { ...gatewayConfig, metaAccessToken: gatewayConfig.metaAccessToken ? '***set***' : '' },
     endpoints: {
-      webhookUrl: `${protocol}://${host}/api/whatsapp/webhook`,
-      twilioVoiceUrl: `${protocol}://${host}/api/twilio/voice`,
+      webhookUrl: `${base}/api/whatsapp/webhook`,
+      twilioVoiceUrl: `${base}/api/twilio/voice`,
       browserWsUrl: `${wsProtocol}://${host}/ws/whatsapp-call`,
       mediaStreamWsUrl: `${wsProtocol}://${host}/ws/media-stream`,
     },
@@ -192,11 +759,34 @@ app.get('/api/whatsapp/config', (req: Request, res: Response) => {
 
 app.post('/api/whatsapp/config', (req: Request, res: Response) => {
   const updates = req.body;
+  // Never allow masking placeholder to wipe the real token.
+  if (updates.metaAccessToken === '***set***') delete updates.metaAccessToken;
   gatewayConfig = {
     ...gatewayConfig,
     ...updates,
   };
-  res.json({ success: true, config: gatewayConfig });
+  res.json({ success: true, config: { ...gatewayConfig, metaAccessToken: gatewayConfig.metaAccessToken ? '***set***' : '' } });
+});
+
+// LiveKit token for the agent worker / dashboard monitor to join the call room.
+app.get('/api/livekit/token', async (req: Request, res: Response) => {
+  if (!livekitConfigured) {
+    res.status(503).json({ error: 'LiveKit not configured (LIVEKIT_URL/API_KEY/API_SECRET)' });
+    return;
+  }
+  const roomName = String(req.query.room || '');
+  const identity = String(req.query.identity || `monitor_${Date.now()}`);
+  if (!roomName) {
+    res.status(400).json({ error: 'Missing ?room=' });
+    return;
+  }
+  try {
+    const token = new AccessToken(livekitApiKey, livekitApiSecret, { identity, name: identity, ttl: '2h' });
+    token.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true, canPublishData: true });
+    res.json({ token: await token.toJwt(), url: livekitUrl, room: roomName });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Token mint failed' });
+  }
 });
 
 // 3. Meta WhatsApp Cloud API Webhook Verification (hub.challenge)
@@ -215,12 +805,11 @@ app.get('/api/whatsapp/webhook', (req: Request, res: Response) => {
 });
 
 // 4. Meta WhatsApp Cloud API Webhook Event Handler (Incoming Calls / Status)
-app.post('/api/whatsapp/webhook', async (req: Request, res: Response) => {
+// IMPORTANT: acknowledge within seconds, then process pickup async.
+app.post('/api/whatsapp/webhook', (req: Request, res: Response) => {
   const payload = req.body;
   console.log('[WhatsApp Webhook] Received event:', JSON.stringify(payload, null, 2));
 
-  // Check if incoming call event across various payload formats:
-  // Format A: Standard Meta WhatsApp Cloud API
   const entry = payload?.entry?.[0];
   const changes = entry?.changes?.[0];
   const value = changes?.value;
@@ -229,9 +818,9 @@ app.post('/api/whatsapp/webhook', async (req: Request, res: Response) => {
   let caller = '';
   let callerName = 'WhatsApp Caller';
   let sdpOffer = '';
+  let eventType = '';
   let phoneNumberId = value?.metadata?.phone_number_id || gatewayConfig.phoneNumberId;
 
-  // Extract contact name from contacts array if provided by Meta
   const contactName = value?.contacts?.[0]?.profile?.name;
 
   if (value?.calls && value.calls.length > 0) {
@@ -239,191 +828,48 @@ app.post('/api/whatsapp/webhook', async (req: Request, res: Response) => {
     callId = callData.id || `wa_call_${Date.now()}`;
     caller = callData.from || callData.caller_id || '+15550000000';
     callerName = contactName || callData.name || callData.display_name || 'WhatsApp Caller';
+    eventType = String(callData.event || callData.status || '').toLowerCase();
     if (callData.session?.sdp) {
       sdpOffer = callData.session.sdp;
+    } else if (typeof callData.sdp === 'string') {
+      sdpOffer = callData.sdp;
     }
   } else if (payload.CallSid || payload.CallDuration || payload.From) {
-    // Twilio Voice / WhatsApp Voice forwarder
     callId = payload.CallSid || `twilio_call_${Date.now()}`;
-    caller = payload.From?.replace('whatsapp:', '') || '+15550000000';
+    caller = (payload.From || '').replace('whatsapp:', '') || '+15550000000';
     callerName = payload.CallerName || contactName || 'WhatsApp Caller';
   } else if (payload.event === 'incoming_call' || payload.call_id || payload.caller) {
-    // Custom/SIP proxy forwarder
     callId = payload.call_id || `sip_call_${Date.now()}`;
     caller = payload.caller || payload.from || '+15550000000';
     callerName = payload.caller_name || contactName || 'WhatsApp Caller';
   }
 
-  if (callId) {
-    console.log(`[WhatsApp Webhook] Incoming call identified: ${callId} from ${caller} (${callerName})`);
-    
-    // Check if call already registered
-    let existingCall = callSessions.get(callId);
-    if (!existingCall) {
-      existingCall = {
-        id: callId,
-        callerNumber: caller,
-        callerName: callerName,
-        direction: 'inbound',
-        status: 'ringing',
-        startedAt: new Date().toISOString(),
-        durationSeconds: 0,
-        packetsIn: 0,
-        packetsOut: 0,
-        avgLatencyMs: 0,
-        interruptionsCount: 0,
-        turns: [
-          {
-            speaker: 'gemini',
-            text: `Incoming WhatsApp call from ${callerName} (${caller}). Meta SDP Offer received.`,
-            timestamp: '00:00',
-          },
-        ],
-      };
-      callSessions.set(callId, existingCall);
-    }
-
-    // Broadcast to connected UI simulator / dashboard
-    notifySockets({
-      type: 'incoming_call_event',
-      call: existingCall,
-      hasSdpOffer: Boolean(sdpOffer),
-    });
-
-    // If LiveKit Cloud Connector is available, route WebRTC SDP media directly to LiveKit
-    let livekitAccepted = false;
-    let acceptStatus = 'waiting_for_agent_or_token';
-    const token = gatewayConfig.metaAccessToken || process.env.META_ACCESS_TOKEN;
-
-    if (livekitConnector && sdpOffer && phoneNumberId && token) {
-      // LiveKit Cloud WhatsApp Connector supports v23.0, v24.0, v25.0, v26.0 (both with and without 'v' prefix)
-      const supportedVersions = ['v23.0', '23.0', 'v24.0', '24.0', 'v25.0', '25.0', 'v22.0', '22.0'];
-      for (const ver of supportedVersions) {
-        if (livekitAccepted) break;
-        try {
-          console.log(`[LiveKit Cloud] Calling acceptWhatsAppCall for ${callId} with version ${ver}...`);
-          const lkRes = await livekitConnector.acceptWhatsAppCall({
-            whatsappPhoneNumberId: phoneNumberId,
-            whatsappApiKey: token,
-            whatsappCloudApiVersion: ver,
-            whatsappCallId: callId,
-            sdp: {
-              type: 'offer',
-              sdp: sdpOffer,
-            } as any,
-            roomName: `wa_${callId.replace(/[^a-zA-Z0-9_-]/g, '_')}`,
-            participantIdentity: caller,
-            participantName: callerName,
-          });
-
-          console.log('[LiveKit Cloud] WhatsApp call accepted successfully with version:', ver, lkRes);
-          existingCall.status = 'connected';
-          livekitAccepted = true;
-          acceptStatus = `accepted_via_livekit_cloud_v${ver}`;
-
-          notifySockets({
-            type: 'call_connected_meta',
-            callId,
-            roomName: lkRes.roomName || `wa_${callId}`,
-            livekitResponse: lkRes,
-          });
-          break;
-        } catch (lkErr: any) {
-          console.warn(`[LiveKit Cloud] Version ${ver} rejected:`, lkErr?.message || lkErr);
-        }
-      }
-    }
-
-    // Fallback: If LiveKit did not accept, attempt direct Meta Graph API accept
-    if (!livekitAccepted && token && sdpOffer && phoneNumberId) {
-      try {
-        console.log(`[Meta Cloud API] Attempting direct accept for WhatsApp Call ${callId}...`);
-        const sdpAnswer = generateSdpAnswer(sdpOffer);
-        const metaRes = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/calls`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            messaging_product: 'whatsapp',
-            call_id: callId,
-            action: 'accept',
-            session: {
-              sdp_type: 'answer',
-              sdp: sdpAnswer,
-            },
-          }),
-        });
-
-        const metaData = await metaRes.json();
-        console.log('[Meta Cloud API] Accept response:', metaData);
-        if (metaRes.ok && metaData.success !== false) {
-          existingCall.status = 'connected';
-          acceptStatus = 'accepted_via_graph_api';
-          notifySockets({
-            type: 'call_connected_meta',
-            callId,
-            metaResponse: metaData,
-          });
-        } else {
-          acceptStatus = `meta_error: ${metaData.error?.message || JSON.stringify(metaData)}`;
-        }
-      } catch (err: any) {
-        console.error('[Meta Cloud API] Error accepting call:', err);
-        acceptStatus = `exception: ${err.message}`;
-      }
-    }
-
-    return res.status(200).json({
-      status: 'call_received',
-      callId,
-      caller,
-      callerName,
-      acceptStatus,
-      instructions: token
-        ? 'Meta Graph API answer dispatched or media stream connecting'
-        : 'To have the server pick up calls without human click, provide META_ACCESS_TOKEN in Persona Settings or connect audio via /ws/media-stream',
-      mediaStreamWsUrl: `/ws/media-stream`,
-    });
+  if (!callId) {
+    res.status(200).json({ status: 'received', message: 'Webhook acknowledged' });
+    return;
   }
 
-  res.status(200).json({ status: 'received', message: 'Webhook acknowledged' });
+  // Remote hangup / reject / timeout -> tear down Gemini + LiveKit room.
+  if (['terminate', 'terminated', 'ended', 'rejected', 'timeout', 'failed'].includes(eventType)) {
+    console.log(`[WhatsApp Webhook] Call ${eventType}: ${callId}`);
+    endCall(callId, eventType);
+    res.status(200).json({ status: 'call_ended', callId });
+    return;
+  }
+
+  // Respond IMMEDIATELY (Meta enforces a tight timeout), then auto-pickup async:
+  // LiveKit room + DIRECT Gemini Live session + Meta signaling accept.
+  res.status(200).json({
+    status: 'call_received',
+    callId,
+    caller,
+    callerName,
+    autoAccept: gatewayConfig.autoAcceptCalls,
+  });
+
+  void processIncomingCall({ callId, caller, callerName, sdpOffer, phoneNumberId })
+    .catch((err) => console.error('[Pickup] pipeline failed:', err));
 });
-
-// Helper: Generate WebRTC SDP Answer matching WhatsApp Offer
-function generateSdpAnswer(offerSdp: string): string {
-  // Extract ice-ufrag, ice-pwd, and ssrc from offer if present
-  const ufragMatch = offerSdp.match(/a=ice-ufrag:([^\r\n]+)/);
-  const pwdMatch = offerSdp.match(/a=ice-pwd:([^\r\n]+)/);
-  const midMatch = offerSdp.match(/a=mid:([^\r\n]+)/);
-
-  const ufrag = ufragMatch ? ufragMatch[1] : 'geminiliveufrag';
-  const pwd = pwdMatch ? pwdMatch[1] : 'geminilivepwd1234567890';
-  const mid = midMatch ? midMatch[1] : 'audio';
-
-  return [
-    'v=0',
-    'o=- 1790423974000 2 IN IP4 127.0.0.1',
-    's=-',
-    't=0 0',
-    'a=msid-semantic: WMS WhatsAppGeminiLive',
-    'm=audio 3480 UDP/TLS/RTP/SAVPF 111',
-    'c=IN IP4 127.0.0.1',
-    'a=rtcp:9 IN IP4 0.0.0.0',
-    `a=ice-ufrag:${ufrag}`,
-    `a=ice-pwd:${pwd}`,
-    'a=fingerprint:sha-256 73:F2:08:6C:27:99:83:66:45:35:F9:06:C9:AC:47:6D:31:83:41:85:A4:FC:72:06:E4:CC:44:8D:52:CB:35:DA',
-    'a=setup:active',
-    `a=mid:${mid}`,
-    'a=sendrecv',
-    'a=rtcp-mux',
-    'a=rtpmap:111 opus/48000/2',
-    'a=fmtp:111 maxaveragebitrate=20000;maxplaybackrate=16000;minptime=20;sprop-maxcapturerate=16000;useinbandfec=1',
-    'a=ptime:20',
-    '',
-  ].join('\r\n');
-}
 
 // 5. Twilio Voice / WhatsApp Voice TwiML Webhook
 app.post('/api/twilio/voice', (req: Request, res: Response) => {
@@ -433,7 +879,7 @@ app.post('/api/twilio/voice', (req: Request, res: Response) => {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Connecting your WhatsApp call directly to Gemini 3.8 Live Voice.</Say>
+  <Say>Connecting your WhatsApp call directly to Gemini Live Voice.</Say>
   <Connect>
     <Stream url="${streamUrl}">
       <Parameter name="geminiVoice" value="${gatewayConfig.voiceName}" />
@@ -454,12 +900,12 @@ app.get('/api/calls', (req: Request, res: Response) => {
   });
 });
 
-// 7. Simulate incoming call trigger
-app.post('/api/whatsapp/simulate-call', (req: Request, res: Response) => {
+// 7. Simulate incoming call trigger (also goes through the real pickup pipeline)
+app.post('/api/whatsapp/simulate-call', async (req: Request, res: Response) => {
   const { callerNumber, callerName } = req.body;
   const callId = `sim_call_${Date.now()}`;
 
-  const call: CallSession = {
+  callSessions.set(callId, {
     id: callId,
     callerNumber: callerNumber || '+1 (555) 789-2041',
     callerName: callerName || 'Marcus Vance',
@@ -472,15 +918,59 @@ app.post('/api/whatsapp/simulate-call', (req: Request, res: Response) => {
     avgLatencyMs: 0,
     interruptionsCount: 0,
     turns: [],
-  };
-
-  callSessions.set(callId, call);
-  notifySockets({
-    type: 'incoming_call_event',
-    call,
   });
 
-  res.json({ success: true, call });
+  const result = await processIncomingCall({
+    callId,
+    caller: callerNumber || '+1 (555) 789-2041',
+    callerName: callerName || 'Marcus Vance',
+    sdpOffer: '',
+    phoneNumberId: gatewayConfig.phoneNumberId,
+  });
+
+  res.json({ success: true, call: callSessions.get(callId), pickup: result });
+});
+
+// Manual accept (dashboard button / API) — starts Gemini Live immediately.
+app.post('/api/calls/:id/accept', async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const call = callSessions.get(id);
+  if (!call) {
+    res.status(404).json({ error: 'Call not found' });
+    return;
+  }
+  const result = await processIncomingCall({
+    callId: id,
+    caller: call.callerNumber,
+    callerName: call.callerName,
+    sdpOffer: '',
+    phoneNumberId: gatewayConfig.phoneNumberId,
+  });
+  res.json({ success: true, call: callSessions.get(id), pickup: result });
+});
+
+// Feed caller audio (base64 PCM 16k) into Gemini for a call — used by bridges.
+app.post('/api/calls/:id/audio', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { audio } = req.body || {};
+  if (!callSessions.has(id)) {
+    res.status(404).json({ error: 'Call not found' });
+    return;
+  }
+  if (!audio) {
+    res.status(400).json({ error: 'Missing audio (base64 PCM 16k)' });
+    return;
+  }
+  const ok = sendAudioToGemini(id, audio);
+  res.json({ success: ok });
+});
+
+// Drain queued Gemini output audio (base64 PCM 24k) — used by bridges.
+app.get('/api/calls/:id/audio-out', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const queue = geminiAudioOutbox.get(id) || [];
+  geminiAudioOutbox.set(id, []);
+  res.json({ callId: id, chunks: queue });
 });
 
 // 8. End Call
@@ -488,14 +978,7 @@ app.post('/api/calls/:id/end', (req: Request, res: Response) => {
   const { id } = req.params;
   const call = callSessions.get(id);
   if (call) {
-    call.status = 'ended';
-    call.endedAt = new Date().toISOString();
-    recentCalls.unshift({ ...call });
-    callSessions.delete(id);
-    notifySockets({
-      type: 'call_ended',
-      callId: id,
-    });
+    endCall(id, 'api_end');
     res.json({ success: true, call });
   } else {
     res.status(404).json({ error: 'Call not found' });
@@ -505,6 +988,7 @@ app.post('/api/calls/:id/end', (req: Request, res: Response) => {
 // WebSocket Server Configuration
 const wssSimulator = new WebSocketServer({ noServer: true });
 const wssMediaStream = new WebSocketServer({ noServer: true });
+const wssCallMedia = new WebSocketServer({ noServer: true });
 
 const activeSimulatorClients = new Set<WebSocket>();
 
@@ -529,6 +1013,10 @@ server.on('upgrade', (request, socket, head) => {
     wssMediaStream.handleUpgrade(request, socket, head, (ws) => {
       wssMediaStream.emit('connection', ws, request);
     });
+  } else if (pathname.startsWith('/ws/call-media/')) {
+    wssCallMedia.handleUpgrade(request, socket, head, (ws) => {
+      wssCallMedia.emit('connection', ws, request);
+    });
   } else {
     socket.destroy();
   }
@@ -539,30 +1027,42 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
   activeSimulatorClients.add(clientWs);
   console.log('[Simulator WS] Client connected. Total clients:', activeSimulatorClients.size);
 
-  let geminiSession: any = null;
+  let browserGeminiSession: any = null;
   let activeCallId: string | null = null;
   let isConnecting = false;
   let latencyStartTime = 0;
 
   async function establishGeminiLiveSession(callId: string, customPrompt?: string, customVoice?: string) {
-    if (geminiSession || isConnecting) return;
+    // If the server already auto-answered with a direct session, the browser
+    // is just a monitor — don't open a second session.
+    if (geminiSessions.has(callId)) {
+      clientWs.send(JSON.stringify({
+        type: 'live_status',
+        callId,
+        status: 'connected',
+        message: 'Server-side Gemini Live already answering this call. Browser is monitoring.',
+      }));
+      return;
+    }
+    if (browserGeminiSession || isConnecting) return;
     isConnecting = true;
 
     try {
-      console.log(`[Gemini Live] Connecting to model gemini-3.8-live for call ${callId}...`);
+      console.log(`[Gemini Live] Connecting browser session ${GEMINI_LIVE_MODEL} for call ${callId}...`);
       clientWs.send(
         JSON.stringify({
           type: 'live_status',
+          callId,
           status: 'connecting',
-          message: 'Initializing Gemini 3.8 Live session...',
+          message: `Initializing ${GEMINI_LIVE_MODEL} session...`,
         })
       );
 
       const voice = customVoice || gatewayConfig.voiceName;
       const prompt = customPrompt || gatewayConfig.systemPrompt;
 
-      geminiSession = await ai.live.connect({
-        model: 'gemini-3.8-live',
+      browserGeminiSession = await ai.live.connect({
+        model: GEMINI_LIVE_MODEL,
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -574,12 +1074,13 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
         },
         callbacks: {
           onopen: () => {
-            console.log('[Gemini Live] Session WebSocket connected successfully!');
+            console.log('[Gemini Live] Browser session connected successfully!');
             clientWs.send(
               JSON.stringify({
                 type: 'live_status',
+                callId,
                 status: 'connected',
-                message: 'Gemini 3.8 Live connected and listening.',
+                message: `${GEMINI_LIVE_MODEL} connected and listening.`,
                 voice,
               })
             );
@@ -600,6 +1101,7 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
                   clientWs.send(
                     JSON.stringify({
                       type: 'audio_chunk',
+                      callId,
                       audio: part.inlineData.data,
                       mimeType: part.inlineData.mimeType || 'audio/pcm;rate=24000',
                     })
@@ -609,6 +1111,7 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
                   clientWs.send(
                     JSON.stringify({
                       type: 'transcript_chunk',
+                      callId,
                       speaker: 'gemini',
                       text: part.text,
                     })
@@ -623,6 +1126,7 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
               clientWs.send(
                 JSON.stringify({
                   type: 'interrupted',
+                  callId,
                   message: 'Gemini output halted by caller speech',
                 })
               );
@@ -639,31 +1143,34 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
             clientWs.send(
               JSON.stringify({
                 type: 'live_error',
-                error: err?.message || 'Gemini 3.8 Live session encountered an error',
+                callId,
+                error: err?.message || `${GEMINI_LIVE_MODEL} session encountered an error`,
               })
             );
           },
           onclose: (e: any) => {
-            console.log('[Gemini Live] Session closed:', e?.reason || 'Normal close');
-            geminiSession = null;
+            console.log('[Gemini Live] Browser session closed:', e?.reason || 'Normal close');
+            browserGeminiSession = null;
             clientWs.send(
               JSON.stringify({
                 type: 'live_status',
+                callId,
                 status: 'disconnected',
-                message: 'Gemini 3.8 Live session disconnected',
+                message: `${GEMINI_LIVE_MODEL} session disconnected`,
               })
             );
           },
         },
       });
 
-      console.log('[Gemini Live] Session connected successfully.');
+      console.log('[Gemini Live] Browser session connected successfully.');
     } catch (error: any) {
       console.error('[Gemini Live Connection Failed]:', error);
       clientWs.send(
         JSON.stringify({
           type: 'live_error',
-          error: error?.message || 'Failed to initialize Gemini 3.8 Live session.',
+          callId,
+          error: error?.message || `Failed to initialize ${GEMINI_LIVE_MODEL} session.`,
         })
       );
     } finally {
@@ -675,40 +1182,12 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
     // Example simulated functions for WhatsApp business
     const calls = toolCall.functionCalls || [];
     const responses = calls.map((call: any) => {
-      let result: any = { status: 'success' };
-      if (call.name === 'check_order_status') {
-        result = {
-          orderId: call.args?.orderId || 'WA-8921',
-          status: 'Shipped',
-          carrier: 'FedEx Priority',
-          estimatedDelivery: 'Tomorrow, 2:30 PM',
-          items: ['Wireless Noise Cancelling Earbuds Pro', 'USB-C Braided Cable 2m'],
-        };
-      } else if (call.name === 'book_appointment') {
-        result = {
-          appointmentId: `APT-${Math.floor(1000 + Math.random() * 9000)}`,
-          date: call.args?.date || 'Tomorrow',
-          time: call.args?.time || '11:00 AM',
-          confirmed: true,
-          confirmationSentViaWhatsApp: true,
-        };
-      } else if (call.name === 'get_business_hours') {
-        result = {
-          mondayToFriday: '8:00 AM - 8:00 PM EST',
-          saturday: '9:00 AM - 5:00 PM EST',
-          sunday: 'Closed',
-        };
-      } else if (call.name === 'escalate_to_human') {
-        result = {
-          ticketCreated: true,
-          queuePosition: 2,
-          estimatedWaitMinutes: 3,
-        };
-      }
+      const result = resolveToolResult(call.name, call.args);
 
       clientWs.send(
         JSON.stringify({
           type: 'function_executed',
+          callId: activeCallId,
           name: call.name,
           args: call.args,
           result,
@@ -722,8 +1201,8 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
       };
     });
 
-    if (geminiSession && geminiSession.sendToolResponse) {
-      geminiSession.sendToolResponse({ functionResponses: responses });
+    if (browserGeminiSession && browserGeminiSession.sendToolResponse) {
+      browserGeminiSession.sendToolResponse({ functionResponses: responses });
     }
   }
 
@@ -758,11 +1237,22 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
             call.status = 'connected';
           }
 
-          await establishGeminiLiveSession(callId, message.systemPrompt, message.voiceName);
+          // Server-side session takes precedence; browser only dials if none.
+          if (!geminiSessions.has(callId)) {
+            await establishGeminiLiveSession(callId, message.systemPrompt, message.voiceName);
+          } else {
+            clientWs.send(JSON.stringify({
+              type: 'live_status',
+              callId,
+              status: 'connected',
+              message: 'Joined live call monitor — server-side Gemini is answering.',
+            }));
+          }
 
           // If caller has an initial greeting or prompt
-          if (message.initialGreeting && call) {
-            geminiSession?.sendClientContent?.({
+          if (message.initialGreeting) {
+            const target = geminiSessions.get(callId) || browserGeminiSession;
+            target?.sendClientContent?.({
               turns: [
                 {
                   role: 'user',
@@ -776,26 +1266,32 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
         }
 
         case 'audio_input': {
-          // Real-time audio from browser mic (PCM 16kHz Base64)
-          if (geminiSession && message.audio) {
-            latencyStartTime = Date.now();
-            try {
-              geminiSession.sendRealtimeInput({
-                audio: {
-                  data: message.audio,
-                  mimeType: 'audio/pcm;rate=16000',
-                },
-              });
-            } catch (err) {
-              // Alternative parameter structure in some SDK builds
-              geminiSession.sendRealtimeInput({
-                mediaChunks: [
-                  {
+          // Real-time audio from browser mic (PCM 16kHz Base64).
+          // Route to whichever session owns this call (server-side first).
+          if (message.audio && activeCallId) {
+            if (geminiSessions.has(activeCallId)) {
+              latencyStartTime = Date.now();
+              sendAudioToGemini(activeCallId, message.audio);
+            } else if (browserGeminiSession) {
+              latencyStartTime = Date.now();
+              try {
+                browserGeminiSession.sendRealtimeInput({
+                  audio: {
                     data: message.audio,
                     mimeType: 'audio/pcm;rate=16000',
                   },
-                ],
-              });
+                });
+              } catch (err) {
+                // Alternative parameter structure in some SDK builds
+                browserGeminiSession.sendRealtimeInput({
+                  mediaChunks: [
+                    {
+                      data: message.audio,
+                      mimeType: 'audio/pcm;rate=16000',
+                    },
+                  ],
+                });
+              }
             }
           }
           break;
@@ -803,8 +1299,9 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
 
         case 'user_text_prompt': {
           // Text simulation turn
-          if (geminiSession && message.text) {
-            geminiSession.sendClientContent?.({
+          const target = (activeCallId && geminiSessions.get(activeCallId)) || browserGeminiSession;
+          if (target && message.text) {
+            target.sendClientContent?.({
               turns: [
                 {
                   role: 'user',
@@ -820,28 +1317,19 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
         case 'end_call': {
           console.log(`[Simulator WS] Ending call: ${activeCallId}`);
           if (activeCallId) {
-            const call = callSessions.get(activeCallId);
-            if (call) {
-              call.status = 'ended';
-              call.endedAt = new Date().toISOString();
-              if (message.durationSeconds) {
-                call.durationSeconds = message.durationSeconds;
-              }
-              recentCalls.unshift({ ...call });
-              callSessions.delete(activeCallId);
-            }
+            endCall(activeCallId, 'browser_end');
           }
-          if (geminiSession) {
+          if (browserGeminiSession) {
             try {
-              if (typeof geminiSession.close === 'function') {
-                geminiSession.close();
-              } else if (geminiSession.conn?.close) {
-                geminiSession.conn.close();
+              if (typeof browserGeminiSession.close === 'function') {
+                browserGeminiSession.close();
+              } else if (browserGeminiSession.conn?.close) {
+                browserGeminiSession.conn.close();
               }
             } catch (e) {
               // Ignore close errors
             }
-            geminiSession = null;
+            browserGeminiSession = null;
           }
           activeCallId = null;
           clientWs.send(JSON.stringify({ type: 'call_ended', callId: activeCallId }));
@@ -856,93 +1344,147 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
   clientWs.on('close', () => {
     activeSimulatorClients.delete(clientWs);
     console.log('[Simulator WS] Client disconnected');
-    if (geminiSession) {
+    if (browserGeminiSession) {
       try {
-        if (typeof geminiSession.close === 'function') geminiSession.close();
-        else if (geminiSession.conn?.close) geminiSession.conn.close();
+        if (typeof browserGeminiSession.close === 'function') browserGeminiSession.close();
+        else if (browserGeminiSession.conn?.close) browserGeminiSession.conn.close();
       } catch (e) {}
-      geminiSession = null;
+      browserGeminiSession = null;
     }
   });
 });
 
-// Handler for Telephony / Twilio / Meta Media Stream WebSocket
-wssMediaStream.on('connection', async (telephonyWs: WebSocket) => {
-  console.log('[Media Stream WS] Telephony connected');
-  let geminiSession: any = null;
-  let streamSid: string = '';
+// Generic bidirectional media bridge: /ws/call-media/<callId>
+// Any UDP-capable worker (LiveKit agent, SIP gateway) joins here over TCP/TLS:
+//   -> send {"event":"start"} then {"event":"media","media":{"payload":"<pcm16k base64>"}}
+//   <- receive {"type":"gemini_audio","audio":"<pcm24k base64>"} + Twilio-style frames
+//      if it identifies as {"event":"start","bridge":"twilio"}.
+wssCallMedia.on('connection', async (bridgeWs: WebSocket, request: any) => {
+  const url = new URL(request.url || '', `http://${request.headers.host}`);
+  const callId = decodeURIComponent(url.pathname.replace('/ws/call-media/', '').split('/')[0] || '');
+  (bridgeWs as any).__bridgeKind = 'raw';
 
-  try {
-    geminiSession = await ai.live.connect({
-      model: 'gemini-3.8-live',
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: gatewayConfig.voiceName },
-          },
-        },
-        systemInstruction: gatewayConfig.systemPrompt,
-      },
-      callbacks: {
-        onmessage: (msg: any) => {
-          const parts = msg.serverContent?.modelTurn?.parts;
-          if (parts) {
-            for (const part of parts) {
-              if (part.inlineData?.data && streamSid) {
-                // Send back audio in Twilio Media format
-                // In full telephony production, convert 24kHz PCM to 8kHz mulaw
-                telephonyWs.send(
-                  JSON.stringify({
-                    event: 'media',
-                    streamSid,
-                    media: {
-                      payload: part.inlineData.data,
-                    },
-                  })
-                );
-              }
-            }
-          }
-          if (msg.serverContent?.interrupted && streamSid) {
-            telephonyWs.send(
-              JSON.stringify({
-                event: 'clear',
-                streamSid,
-              })
-            );
-          }
-        },
-      },
-    });
-  } catch (err) {
-    console.error('[Media Stream WS] Failed to connect Gemini Live:', err);
+  console.log(`[Call Media] Bridge connected for call ${callId || '(unknown)'}`);
+
+  if (callId) {
+    const set = callMediaBridges.get(callId) || new Set();
+    set.add(bridgeWs);
+    callMediaBridges.set(callId, set);
+    // Ensure Gemini is live even if webhook accept is still in flight.
+    if (callSessions.has(callId) && !geminiSessions.has(callId)) {
+      void startGeminiLiveForCall(callId);
+    }
+    flushGeminiAudioToBridges(callId);
   }
+
+  bridgeWs.on('message', (data: any) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      const cid = msg.callId || callId;
+      if (msg.event === 'start') {
+        if (msg.bridge === 'twilio') (bridgeWs as any).__bridgeKind = 'twilio';
+        (bridgeWs as any).__streamSid = msg.start?.streamSid || msg.streamSid || '';
+        console.log(`[Call Media] Stream started for call ${cid}`);
+        return;
+      }
+      if ((msg.event === 'media' || msg.type === 'caller_audio') && cid) {
+        const payload = msg.media?.payload || msg.audio;
+        if (!payload) return;
+        if ((bridgeWs as any).__bridgeKind === 'twilio' || msg.event === 'media') {
+          // Twilio μ-law 8k -> PCM 16k -> Gemini.
+          const pcm16 = resampleMulawToPCM16(Buffer.from(payload, 'base64'));
+          sendAudioToGemini(cid, pcm16.toString('base64'));
+        } else {
+          sendAudioToGemini(cid, payload);
+        }
+        return;
+      }
+      if (msg.event === 'stop' && cid) {
+        console.log(`[Call Media] Stream stopped for call ${cid}`);
+        return;
+      }
+    } catch (e) {
+      console.error('[Call Media] Message error:', e);
+    }
+  });
+
+  bridgeWs.on('close', () => {
+    if (callId) {
+      const set = callMediaBridges.get(callId);
+      if (set) {
+        set.delete(bridgeWs);
+        if (set.size === 0) callMediaBridges.delete(callId);
+      }
+    }
+    console.log(`[Call Media] Bridge closed for call ${callId}`);
+  });
+});
+
+// Handler for Telephony / Twilio Media Streams (Twilio <-> Gemini Live).
+// Twilio terminates UDP itself and speaks WebSocket (works on Cloud Run),
+// so this is the voice path that works TODAY while direct Meta RTP needs
+// MEDIA_ANNOUNCE_IP pointing at a UDP-capable host.
+wssMediaStream.on('connection', async (telephonyWs: WebSocket) => {
+  console.log('[Media Stream WS] Twilio telephony connected');
+  (telephonyWs as any).__bridgeKind = 'twilio';
+  let streamSid = '';
+  let callId = '';
+
+  const ensureSession = async () => {
+    if (!callId) {
+      callId = `twilio_call_${Date.now()}`;
+      callSessions.set(callId, {
+        id: callId,
+        callerNumber: 'Twilio Caller',
+        callerName: 'WhatsApp Caller (Twilio)',
+        direction: 'inbound',
+        status: 'connected',
+        startedAt: new Date().toISOString(),
+        durationSeconds: 0,
+        packetsIn: 0,
+        packetsOut: 0,
+        avgLatencyMs: 0,
+        interruptionsCount: 0,
+        turns: [],
+      });
+      const set = callMediaBridges.get(callId) || new Set();
+      set.add(telephonyWs);
+      callMediaBridges.set(callId, set);
+    }
+    if (!geminiSessions.has(callId)) {
+      await startGeminiLiveForCall(callId);
+    }
+  };
+
+  await ensureSession().catch((e) => console.error('[Media Stream WS] session init failed:', e));
 
   telephonyWs.on('message', (data: any) => {
     try {
       const msg = JSON.parse(data.toString());
+      if (msg.event === 'connected') return;
       if (msg.event === 'start') {
         streamSid = msg.start?.streamSid || '';
-        console.log(`[Media Stream WS] Stream started: ${streamSid}`);
-      } else if (msg.event === 'media' && geminiSession) {
+        (telephonyWs as any).__streamSid = streamSid;
+        const custom = msg.start?.customParameters || {};
+        if (custom.callId && callSessions.has(custom.callId)) {
+          // Rebind this socket to the real WhatsApp call if provided.
+          const old = callMediaBridges.get(callId);
+          old?.delete(telephonyWs);
+          callId = custom.callId;
+          const set = callMediaBridges.get(callId) || new Set();
+          set.add(telephonyWs);
+          callMediaBridges.set(callId, set);
+        }
+        console.log(`[Media Stream WS] Stream started: ${streamSid} call=${callId}`);
+      } else if (msg.event === 'media' && msg.media?.payload && callId) {
         // Twilio sends payload as base64 mulaw 8000Hz
         const rawMulaw = Buffer.from(msg.media.payload, 'base64');
         const pcm16Buffer = resampleMulawToPCM16(rawMulaw);
-        geminiSession.sendRealtimeInput({
-          audio: {
-            data: pcm16Buffer.toString('base64'),
-            mimeType: 'audio/pcm;rate=16000',
-          },
-        });
+        sendAudioToGemini(callId, pcm16Buffer.toString('base64'));
       } else if (msg.event === 'stop') {
-        console.log(`[Media Stream WS] Stream stopped: ${streamSid}`);
-        if (geminiSession) {
-          try {
-            if (typeof geminiSession.close === 'function') geminiSession.close();
-            else if (geminiSession.conn?.close) geminiSession.conn.close();
-          } catch (e) {}
-        }
+        console.log(`[Media Stream WS] Stream stopped: ${streamSid} call=${callId}`);
+        const set = callMediaBridges.get(callId);
+        set?.delete(telephonyWs);
       }
     } catch (e) {
       console.error('[Media Stream WS] Message error:', e);
@@ -951,11 +1493,9 @@ wssMediaStream.on('connection', async (telephonyWs: WebSocket) => {
 
   telephonyWs.on('close', () => {
     console.log('[Media Stream WS] Telephony socket closed');
-    if (geminiSession) {
-      try {
-        if (typeof geminiSession.close === 'function') geminiSession.close();
-        else if (geminiSession.conn?.close) geminiSession.conn.close();
-      } catch (e) {}
+    if (callId) {
+      const set = callMediaBridges.get(callId);
+      set?.delete(telephonyWs);
     }
   });
 });
@@ -981,11 +1521,15 @@ async function setupVite() {
 setupVite().then(() => {
   server.listen(PORT, () => {
     console.log(`\n=================================================`);
-    console.log(` WhatsApp Gemini 3.8 Live Voice Gateway Running!`);
+    console.log(` WhatsApp Gemini Live Voice Gateway Running!`);
     console.log(` URL: http://localhost:${PORT}`);
-    console.log(` Model: gemini-3.8-live (Low-latency Audio PCM)`);
+    console.log(` Model: ${GEMINI_LIVE_MODEL} (fallback: ${GEMINI_LIVE_FALLBACK_MODEL})`);
+    console.log(` Auto-accept: ${gatewayConfig.autoAcceptCalls ? 'ON (direct Gemini pickup)' : 'OFF (manual)'}`);
+    console.log(` LiveKit: ${livekitConfigured ? livekitUrl : 'NOT CONFIGURED'}`);
+    console.log(` Media announce IP: ${MEDIA_ANNOUNCE_IP || '(unset — set MEDIA_ANNOUNCE_IP)'}`);
     console.log(` WhatsApp Webhook: /api/whatsapp/webhook`);
     console.log(` Telephony Media Stream: /ws/media-stream`);
+    console.log(` Call media bridge: /ws/call-media/:callId`);
     console.log(` Browser Live Call: /ws/whatsapp-call`);
     console.log(`=================================================\n`);
   });

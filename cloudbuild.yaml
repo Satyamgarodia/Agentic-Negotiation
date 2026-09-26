@@ -55,9 +55,14 @@ steps:
       - '--memory=1Gi'
       - '--timeout=300' # max request timeout; keeps long-lived call WebSockets alive
       - '--max-instances=10'
-      - '--set-env-vars=NODE_ENV=production'
-    # To inject secrets at deploy time, add e.g.:
-    # - '--set-secrets=GEMINI_API_KEY=gemini-api-key:latest'
+    # No --set-env-vars: non-secret config is hardcoded in server.ts.
+    # Non-secret overrides only (rarely needed):
+    # - '--update-env-vars=MEDIA_ANNOUNCE_IP=<UDP-reachable-IP>'
+    # Secrets (set once in console, or uncomment to bind at deploy time):
+    # - '--set-secrets=GEMINI_API_KEY=gemini-api-key:latest,META_ACCESS_TOKEN=meta-token:latest,LIVEKIT_API_KEY=livekit-key:latest,LIVEKIT_API_SECRET=livekit-secret:latest'
+    # NOTE: Cloud Run has no UDP ingress. WhatsApp RTP audio needs MEDIA_ANNOUNCE_IP
+    # pointing at a UDP-capable host (LiveKit Cloud TURN / media-bridge). The Twilio
+    # media-stream path (/ws/media-stream) works on Cloud Run without UDP.
 
 substitutions:
   _REGION: asia-south1 # override per-build: gcloud builds submit --substitutions=_REGION=us-central1
