@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install dependencies first (better layer caching)
 COPY package.json ./
-RUN npm install --legacy-peer-deps
+RUN npm install --legacy-peer-deps --no-audit --no-fund
 # Copy the rest of the source and build the frontend into dist/
 COPY . .
 RUN npm run build

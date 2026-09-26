@@ -7,10 +7,11 @@ import {
   History,
   ShieldCheck,
   Zap,
+  Terminal,
 } from 'lucide-react';
 import { CallStatus } from '../types';
 
-export type ActiveTab = 'call-simulator' | 'webhook-setup' | 'architecture' | 'persona-tools' | 'call-history';
+export type ActiveTab = 'call-simulator' | 'webhook-setup' | 'architecture' | 'persona-tools' | 'call-history' | 'logs';
 
 interface HeaderProps {
   activeTab: ActiveTab;
@@ -33,6 +34,7 @@ export const Header: React.FC<HeaderProps> = ({
     { id: 'architecture' as ActiveTab, label: 'Audio Pipeline Architecture', icon: Layers },
     { id: 'persona-tools' as ActiveTab, label: 'AI Voice & Tools', icon: Sliders },
     { id: 'call-history' as ActiveTab, label: 'Call Logs & Transcripts', icon: History },
+    { id: 'logs' as ActiveTab, label: 'Live Server Logs', icon: Terminal },
   ];
 
   return (

@@ -108,6 +108,8 @@ export interface CallSession {
   interruptionsCount: number;
   livekitRoom?: string;
   geminiConnected?: boolean;
+  pickupStage?: string;
+  stageHistory?: Array<{ stage: string; ts: string; detail?: string }>;
   turns: Array<{
     speaker: 'caller' | 'gemini';
     text: string;
@@ -165,6 +167,71 @@ const recentCalls: CallSession[] = [
     ]
   }
 ];
+
+// ---------------------------------------------------------------------------
+// Structured pipeline logging: every pickup stage emits a correlated entry to
+// the console (Cloud Run Logs Explorer) AND an in-memory ring buffer served at
+// GET /api/logs, SSE /api/logs/stream, and GET /api/calls/:id/timeline.
+// Cloud Console filters to try:  "pickup"  |  "[livekit]"  |  "[gemini]"  |
+// "[meta]"  |  "[media]"  |  "[<callId>]"
+// ---------------------------------------------------------------------------
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+interface LogEntry {
+  ts: string;
+  level: LogLevel;
+  stage: string;
+  callId?: string;
+  msg: string;
+  data?: any;
+}
+
+const LOG_BUFFER_MAX = 1500;
+const logBuffer: LogEntry[] = [];
+const logStreamClients = new Set<any>();
+const loggedFirstAudioIn = new Set<string>();
+const loggedFirstAudioOut = new Set<string>();
+
+function plog(level: LogLevel, stage: string, msg: string, opts?: { callId?: string; data?: any }) {
+  const entry: LogEntry = {
+    ts: new Date().toISOString(),
+    level,
+    stage,
+    callId: opts?.callId,
+    msg,
+    ...(opts?.data !== undefined ? { data: opts.data } : {}),
+  };
+  logBuffer.push(entry);
+  if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.splice(0, logBuffer.length - LOG_BUFFER_MAX);
+
+  // Single-line console output for Cloud Run Logs Explorer.
+  const dataStr = opts?.data !== undefined ? ` :: ${JSON.stringify(opts.data)}` : '';
+  const line = `[${entry.ts}][${level.toUpperCase()}][${stage}]${entry.callId ? `[${entry.callId}]` : ''} ${msg}${dataStr}`;
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.log(line);
+
+  // Fan out to live SSE tails.
+  const payload = `data: ${JSON.stringify(entry)}\n\n`;
+  for (const res of logStreamClients) {
+    try {
+      res.write(payload);
+    } catch {
+      logStreamClients.delete(res);
+    }
+  }
+}
+
+// Per-call pipeline stage tracker (surfaced in GET /api/calls + timeline).
+function setStage(callId: string, stage: string, detail?: string, level: LogLevel = 'info') {
+  const call = callSessions.get(callId);
+  if (call) {
+    call.pickupStage = stage;
+    call.stageHistory = call.stageHistory || [];
+    call.stageHistory.push({ stage, ts: new Date().toISOString(), ...(detail ? { detail } : {}) });
+  }
+  plog(level, 'pickup', `stage=${stage}${detail ? ` :: ${detail}` : ''}`, { callId });
+}
 
 // Helper: Convert μ-law sample to Linear PCM 16-bit
 function mulawToLinear(muLawByte: number): number {
@@ -228,16 +295,25 @@ function resamplePCM24kToMulaw8k(pcm24kBase64: string): Buffer {
 // ---------------------------------------------------------------------------
 async function ensureLiveKitRoom(callId: string, callerName: string) {
   const cached = livekitRooms.get(callId);
-  if (cached) return cached;
-  if (!roomService || !livekitConfigured) return null;
+  if (cached) {
+    plog('debug', 'livekit', `reusing room ${cached.roomName}`, { callId });
+    return cached;
+  }
+  if (!roomService || !livekitConfigured) {
+    plog('warn', 'livekit', 'skipped — LIVEKIT_URL/API_KEY/API_SECRET not fully set', { callId });
+    return null;
+  }
 
   const roomName = `wa_${callId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100)}`;
+  const t0 = Date.now();
+  plog('info', 'livekit', `creating room ${roomName} ...`, { callId });
   try {
     try {
       await roomService.createRoom({ name: roomName, emptyTimeout: 10 * 60, maxParticipants: 10 });
     } catch (e: any) {
       // Room already exists — fine, reuse it.
       if (!String(e?.message || e).toLowerCase().includes('exist')) throw e;
+      plog('debug', 'livekit', `room ${roomName} already exists, reusing`, { callId });
     }
 
     const mint = async (identity: string, name: string) => {
@@ -256,10 +332,10 @@ async function ensureLiveKitRoom(callId: string, callerName: string) {
       callerToken: await mint(`caller_${callId}`.slice(0, 100), callerName),
     };
     livekitRooms.set(callId, info);
-    console.log(`[LiveKit] Room ready: ${roomName} for call ${callId}`);
+    plog('info', 'livekit', `room ready: ${roomName} (tokens minted)`, { callId, data: { tookMs: Date.now() - t0, roomName } });
     return info;
-  } catch (e) {
-    console.error('[LiveKit] Room setup failed:', e);
+  } catch (e: any) {
+    plog('error', 'livekit', 'room setup failed', { callId, data: { error: e?.message || String(e), tookMs: Date.now() - t0 } });
     return null;
   }
 }
@@ -343,6 +419,7 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
   if (!call) return false;
 
   if (!apiKey) {
+    setStage(callId, 'gemini_failed', 'GEMINI_API_KEY missing on server', 'error');
     console.error('[Gemini Live] GEMINI_API_KEY missing — cannot auto-answer call', callId);
     notifySockets({ type: 'live_error', callId, error: 'GEMINI_API_KEY missing on server' });
     return false;
@@ -352,6 +429,8 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
 
   for (const model of modelsToTry) {
     try {
+      const t0 = Date.now();
+      setStage(callId, 'gemini_connecting', model);
       console.log(`[Gemini Live] Connecting model ${model} for call ${callId}...`);
       notifySockets({ type: 'live_status', callId, status: 'connecting', message: `Initializing ${model}...` });
 
@@ -368,6 +447,7 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
         callbacks: {
           onopen: () => {
             console.log(`[Gemini Live] Session open for call ${callId} (${model})`);
+            setStage(callId, 'gemini_connected', `${model} open in ${Date.now() - t0}ms`);
             call.geminiConnected = true;
             if (call.status === 'ringing') call.status = 'connected';
             notifySockets({ type: 'live_status', callId, status: 'connected', message: `${model} connected and listening.`, model });
@@ -429,6 +509,7 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
           },
           onclose: (e: any) => {
             console.log(`[Gemini Live] Session closed for call ${callId}:`, e?.reason || 'Normal close');
+            plog('warn', 'gemini', `session closed: ${e?.reason || 'normal close'}`, { callId });
             geminiSessions.delete(callId);
             if (call.geminiConnected) {
               call.geminiConnected = false;
@@ -455,13 +536,16 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
           ],
           turnComplete: true,
         });
+        plog('info', 'gemini', 'auto-greeting sent to caller', { callId });
       } catch (e) {
+        plog('warn', 'gemini', 'greeting send failed', { callId, data: { error: (e as any)?.message || String(e) } });
         console.warn('[Gemini Live] greeting send failed:', e);
       }
 
       console.log(`[Gemini Live] Session established for call ${callId} (${model})`);
       return true;
     } catch (err: any) {
+      setStage(callId, 'gemini_failed', `${model}: ${err?.message || err}`, 'error');
       console.error(`[Gemini Live] Connect failed for model ${model}:`, err?.message || err);
       notifySockets({ type: 'live_error', callId, model, error: err?.message || `Failed to connect ${model}` });
     }
@@ -481,6 +565,10 @@ function sendAudioToGemini(callId: string, pcm16kBase64: string) {
     const call = callSessions.get(callId);
     if (call) {
       call.packetsIn += 1;
+      if (!loggedFirstAudioIn.has(callId)) {
+        loggedFirstAudioIn.add(callId);
+        setStage(callId, 'media_flowing_in', 'first caller audio frames reached Gemini');
+      }
       if (call.status === 'connected') call.status = 'speaking';
     }
     return true;
@@ -494,6 +582,8 @@ function closeGeminiSession(callId: string) {
   const session = geminiSessions.get(callId);
   geminiSessions.delete(callId);
   geminiAudioOutbox.delete(callId);
+  loggedFirstAudioIn.delete(callId);
+  loggedFirstAudioOut.delete(callId);
   if (session) {
     try {
       if (typeof session.close === 'function') session.close();
@@ -511,6 +601,10 @@ function flushGeminiAudioToBridges(callId: string) {
   const queue = geminiAudioOutbox.get(callId);
   if (!queue || queue.length === 0) return;
   geminiAudioOutbox.set(callId, []);
+  if (!loggedFirstAudioOut.has(callId)) {
+    loggedFirstAudioOut.add(callId);
+    setStage(callId, 'media_flowing_out', 'first Gemini voice frames produced');
+  }
 
   for (const client of bridges) {
     if (client.readyState !== WebSocket.OPEN) continue;
@@ -592,6 +686,12 @@ async function acceptMetaCall(
 ): Promise<string> {
   const sdpAnswer = generateSdpAnswer(sdpOffer);
   const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${phoneNumberId}/calls`;
+  const t0 = Date.now();
+  // NOTE: token + full SDP are deliberately never logged.
+  plog('info', 'meta', `POST accept call (sdp offer ${sdpOffer.length}B -> answer ${sdpAnswer.length}B)`, {
+    callId,
+    data: { url, phoneNumberId, graphVersion: META_GRAPH_VERSION },
+  });
   console.log(`[Meta Cloud API] Accepting WhatsApp call ${callId} via ${url} ...`);
   const res = await fetch(url, {
     method: 'POST',
@@ -605,10 +705,14 @@ async function acceptMetaCall(
   });
   const data = await res.json().catch(() => ({}));
   console.log('[Meta Cloud API] Accept response:', JSON.stringify(data));
+  const tookMs = Date.now() - t0;
   if (res.ok && (data as any).success !== false && !(data as any).error) {
+    setStage(callId, 'meta_accepted', `HTTP ${res.status} in ${tookMs}ms`);
     return 'accepted_via_graph_api';
   }
-  return `meta_error: ${(data as any)?.error?.message || JSON.stringify(data)}`;
+  const errMsg = (data as any)?.error?.message || JSON.stringify(data);
+  setStage(callId, 'meta_failed', `HTTP ${res.status}: ${errMsg}`, 'error');
+  return `meta_error: ${errMsg}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +726,8 @@ async function processIncomingCall(opts: {
   phoneNumberId: string;
 }) {
   const { callId, caller, callerName, sdpOffer, phoneNumberId } = opts;
+  const pipeStart = Date.now();
+  setStage(callId, 'pickup_started', `from ${caller} (${callerName}), sdp=${sdpOffer ? `${sdpOffer.length}B` : 'none'}`);
 
   let call = callSessions.get(callId);
   if (!call) {
@@ -643,9 +749,13 @@ async function processIncomingCall(opts: {
   }
 
   // 1. LiveKit room for this call (media gateway orchestration over TCP/TLS).
+  setStage(callId, 'livekit_start');
   const room = await ensureLiveKitRoom(callId, callerName);
   if (room) {
     call.livekitRoom = room.roomName;
+    setStage(callId, 'livekit_ready', room.roomName);
+  } else {
+    setStage(callId, 'livekit_skipped', 'continuing without room — direct Gemini bridge only', 'warn');
   }
 
   notifySockets({
@@ -664,6 +774,9 @@ async function processIncomingCall(opts: {
 
   // 2. DIRECT connect: Gemini Live session starts NOW — no browser click.
   const geminiOk = await startGeminiLiveForCall(callId);
+  if (!geminiOk) {
+    setStage(callId, 'pickup_failed', 'gemini session could not start — check [gemini] logs', 'error');
+  }
 
   // 3. Signaling accept toward Meta (needs token + SDP offer).
   const token = gatewayConfig.metaAccessToken || process.env.META_ACCESS_TOKEN || '';
@@ -680,9 +793,11 @@ async function processIncomingCall(opts: {
     }
   } else if (!token) {
     acceptStatus = 'missing_meta_token';
+    setStage(callId, 'meta_skipped', 'META_ACCESS_TOKEN missing — Gemini is live but Meta-side still rings', 'warn');
     console.warn('[Pickup] META_ACCESS_TOKEN missing — signaling accept skipped. Gemini session is live; add token to auto-answer Meta-side ringing.');
   } else if (!sdpOffer) {
     acceptStatus = 'no_sdp_offer_in_webhook';
+    setStage(callId, 'meta_skipped', 'no SDP offer in webhook — Gemini live, media bridge/Twilio path only', 'warn');
     console.warn('[Pickup] Webhook had no SDP offer — Gemini session is live; media bridge / Twilio path can still carry audio.');
   }
 
@@ -695,16 +810,29 @@ async function processIncomingCall(opts: {
   });
 
   console.log(`[Pickup] call=${callId} gemini=${geminiOk ? 'connected' : 'FAILED'} accept=${acceptStatus}`);
+  setStage(
+    callId,
+    geminiOk && acceptStatus.startsWith('accepted') ? 'pickup_complete' : 'pickup_partial',
+    `total ${Date.now() - pipeStart}ms, gemini=${geminiOk}, accept=${acceptStatus}`,
+    geminiOk ? 'info' : 'error',
+  );
   return { acceptStatus, roomName: room?.roomName || null, geminiConnected: geminiOk };
 }
 
 function endCall(callId: string, reason = 'ended') {
   const call = callSessions.get(callId);
   if (call) {
+    const secs = Math.round((Date.now() - new Date(call.startedAt).getTime()) / 1000);
+    plog('info', 'pickup', `call ended: reason=${reason}, duration≈${secs}s`, {
+      callId,
+      data: { packetsIn: call.packetsIn, packetsOut: call.packetsOut, turns: call.turns.length, stage: call.pickupStage },
+    });
     call.status = 'ended';
     call.endedAt = new Date().toISOString();
     recentCalls.unshift({ ...call });
     callSessions.delete(callId);
+  } else {
+    plog('debug', 'pickup', `endCall for unknown call (reason=${reason})`, { callId });
   }
   closeGeminiSession(callId);
   const bridges = callMediaBridges.get(callId);
@@ -844,6 +972,15 @@ app.post('/api/whatsapp/webhook', (req: Request, res: Response) => {
     callerName = payload.caller_name || contactName || 'WhatsApp Caller';
   }
 
+  if (callId) {
+    plog('info', 'webhook', `incoming call parsed: event=${eventType || '(none)'} sdp=${sdpOffer ? `${sdpOffer.length}B` : 'MISSING'}`, {
+      callId,
+      data: { caller, callerName, phoneNumberId, contactName: contactName || null },
+    });
+  } else {
+    plog('debug', 'webhook', 'payload has no call object — ack only');
+  }
+
   if (!callId) {
     res.status(200).json({ status: 'received', message: 'Webhook acknowledged' });
     return;
@@ -971,6 +1108,44 @@ app.get('/api/calls/:id/audio-out', (req: Request, res: Response) => {
   const queue = geminiAudioOutbox.get(id) || [];
   geminiAudioOutbox.set(id, []);
   res.json({ callId: id, chunks: queue });
+});
+
+// 9. Pipeline logs (in-memory ring buffer, newest last in store)
+app.get('/api/logs', (req: Request, res: Response) => {
+  const level = String(req.query.level || '').toLowerCase();
+  const callId = String(req.query.callId || '');
+  const stage = String(req.query.stage || '').toLowerCase();
+  const limit = Math.min(parseInt(String(req.query.limit || '300'), 10) || 300, LOG_BUFFER_MAX);
+  let entries = logBuffer;
+  if (level) entries = entries.filter((e) => e.level === level);
+  if (callId) entries = entries.filter((e) => e.callId === callId);
+  if (stage) entries = entries.filter((e) => e.stage === stage);
+  res.json({ count: entries.length, logs: entries.slice(-limit).reverse() });
+});
+
+// Live tail of pipeline logs (Server-Sent Events)
+app.get('/api/logs/stream', (req: Request, res: Response) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write(`data: ${JSON.stringify({ hello: 'log-stream-connected' })}\n\n`);
+  logStreamClients.add(res);
+  req.on('close', () => {
+    logStreamClients.delete(res);
+  });
+});
+
+// Per-call timeline: stage history + correlated log entries
+app.get('/api/calls/:id/timeline', (req: Request, res: Response) => {
+  const call = callSessions.get(req.params.id) || recentCalls.find((c) => c.id === req.params.id);
+  if (!call) {
+    res.status(404).json({ error: 'Call not found' });
+    return;
+  }
+  const logs = logBuffer.filter((e) => e.callId === req.params.id);
+  res.json({ call, logs });
 });
 
 // 8. End Call
@@ -1365,6 +1540,7 @@ wssCallMedia.on('connection', async (bridgeWs: WebSocket, request: any) => {
   (bridgeWs as any).__bridgeKind = 'raw';
 
   console.log(`[Call Media] Bridge connected for call ${callId || '(unknown)'}`);
+  plog('info', 'media', `bridge connected (kind=${(bridgeWs as any).__bridgeKind})`, { callId: callId || undefined });
 
   if (callId) {
     const set = callMediaBridges.get(callId) || new Set();
@@ -1476,6 +1652,7 @@ wssMediaStream.on('connection', async (telephonyWs: WebSocket) => {
           callMediaBridges.set(callId, set);
         }
         console.log(`[Media Stream WS] Stream started: ${streamSid} call=${callId}`);
+        plog('info', 'media', `twilio stream started: ${streamSid}`, { callId });
       } else if (msg.event === 'media' && msg.media?.payload && callId) {
         // Twilio sends payload as base64 mulaw 8000Hz
         const rawMulaw = Buffer.from(msg.media.payload, 'base64');

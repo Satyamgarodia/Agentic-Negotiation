@@ -22,10 +22,20 @@
 # Or connect the repo in Cloud Console -> Cloud Build -> Triggers (builds on every push).
 
 steps:
-  # 1. Build the container image (tagged with commit SHA + latest)
+  # 0. Pull previous image so unchanged layers (npm install) reuse cache.
+  # First-ever build has nothing to pull — failure is OK.
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args: ['-c', 'docker pull gcr.io/$PROJECT_ID/gemini-call-link:latest || true']
+    allowFailure: true
+
+  # 1. Build the container image (tagged with commit SHA + latest).
+  # Unchanged package.json => npm install layer comes from cache (seconds).
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
+      - '--cache-from'
+      - 'gcr.io/$PROJECT_ID/gemini-call-link:latest'
       - '-t'
       - 'gcr.io/$PROJECT_ID/gemini-call-link:$COMMIT_SHA'
       - '-t'

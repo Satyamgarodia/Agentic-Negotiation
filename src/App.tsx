@@ -5,6 +5,7 @@ import { WebhookSetupTab } from './components/WebhookSetupTab';
 import { ArchitectureTab } from './components/ArchitectureTab';
 import { PersonaSettingsTab } from './components/PersonaSettingsTab';
 import { CallHistoryTab } from './components/CallHistoryTab';
+import { LogsTab } from './components/LogsTab';
 import {
   CallStatus,
   Turn,
@@ -479,6 +480,8 @@ You have access to tools for checking orders, scheduling appointments, and trans
         {activeTab === 'call-history' && (
           <CallHistoryTab calls={recentCalls} />
         )}
+
+        {activeTab === 'logs' && <LogsTab />}
       </main>
 
       {/* Bottom Footer with Status */}

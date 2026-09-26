@@ -4,12 +4,13 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "tsx watch server.ts",
     "build": "vite build",
     "start": "tsx server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "deploy:quick": "gcloud run deploy gemini-call-link --source . --region=asia-southeast1 --allow-unauthenticated --port=8080 --cpu=1 --memory=1Gi --timeout=300"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
