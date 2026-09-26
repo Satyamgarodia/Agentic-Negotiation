@@ -1,0 +1,10 @@
+{
+  "name": "WhatsApp Gemini 3.8 Live Voice Gateway",
+  "description": "Real-time WhatsApp voice call bridge connected directly to Gemini 3.8 Live with low-latency bidirectional audio streaming, Webhook routing, and interactive call testing.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
