@@ -499,6 +499,46 @@ function resolveToolResult(name: string, args: any) {
   return { status: 'ok' };
 }
 
+// Two connect-config variants: 'full' is what we want (VAD turn-taking
+// tuning + end_call tool); 'minimal' is the last-known-good shape (no VAD
+// block, no end_call tool). If the Live API ever rejects a new config key,
+// the minimal retry keeps the call alive instead of every attempt failing
+// outright (which surfaces as total audio loss on an answered call).
+function buildLiveConfig(variant: 'full' | 'minimal'): any {
+  const fullTools = buildGeminiTools() as any;
+  const tools =
+    variant === 'full'
+      ? fullTools
+      : fullTools.map((t: any) => ({
+        ...t,
+        functionDeclarations: (t.functionDeclarations || []).filter((d: any) => d.name !== 'end_call'),
+      }));
+  const config: any = {
+    responseModalities: [Modality.AUDIO],
+    speechConfig: {
+      voiceConfig: { prebuiltVoiceConfig: { voiceName: gatewayConfig.voiceName } },
+    },
+    systemInstruction: gatewayConfig.systemPrompt,
+    tools,
+  };
+  if (variant === 'full') {
+    // Faster turn-taking: shorten the end-of-speech pause before the
+    // model starts replying. HIGH/HIGH keeps barge-in sensitive while
+    // reacting quickly; 400ms silence is the middle ground — lower
+    // than this cuts into natural mid-sentence pauses.
+    config.realtimeInputConfig = {
+      automaticActivityDetection: {
+        disabled: false,
+        startOfSpeechSensitivity: 'START_OF_SPEECH_SENSITIVITY_HIGH',
+        endOfSpeechSensitivity: 'END_OF_SPEECH_SENSITIVITY_HIGH',
+        prefixPaddingMs: 100,
+        silenceDurationMs: 400,
+      },
+    };
+  }
+  return config;
+}
+
 async function startGeminiLiveForCall(callId: string): Promise<boolean> {
   if (geminiSessions.has(callId)) return true;
   const call = callSessions.get(callId);
@@ -512,37 +552,20 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
   }
 
   const modelsToTry = [GEMINI_LIVE_MODEL, GEMINI_LIVE_FALLBACK_MODEL].filter((m, i, arr) => m && arr.indexOf(m) === i);
+  // Full config first, minimal retry per model (see buildLiveConfig).
+  const attempts: Array<{ model: string; variant: 'full' | 'minimal' }> = [];
+  for (const model of modelsToTry) attempts.push({ model, variant: 'full' }, { model, variant: 'minimal' });
 
-  for (const model of modelsToTry) {
+  for (const { model, variant } of attempts) {
     try {
       const t0 = Date.now();
-      setStage(callId, 'gemini_connecting', model);
-      console.log(`[Gemini Live] Connecting model ${model} for call ${callId}...`);
+      setStage(callId, 'gemini_connecting', `${model} [${variant}]`);
+      console.log(`[Gemini Live] Connecting model ${model} [${variant}] for call ${callId}...`);
       notifySockets({ type: 'live_status', callId, status: 'connecting', message: `Initializing ${model}...` });
 
       const session = await ai.live.connect({
         model,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: gatewayConfig.voiceName } },
-          },
-          systemInstruction: gatewayConfig.systemPrompt,
-          tools: buildGeminiTools() as any,
-          // Faster turn-taking: shorten the end-of-speech pause before the
-          // model starts replying. HIGH/HIGH keeps barge-in sensitive while
-          // reacting quickly; 400ms silence is the middle ground — lower
-          // than this cuts into natural mid-sentence pauses.
-          realtimeInputConfig: {
-            automaticActivityDetection: {
-              disabled: false,
-              startOfSpeechSensitivity: 'START_OF_SPEECH_SENSITIVITY_HIGH',
-              endOfSpeechSensitivity: 'END_OF_SPEECH_SENSITIVITY_HIGH',
-              prefixPaddingMs: 100,
-              silenceDurationMs: 400,
-            },
-          },
-        } as any,
+        config: buildLiveConfig(variant),
         callbacks: {
           onopen: () => {
             console.log(`[Gemini Live] Session open for call ${callId} (${model})`);
@@ -679,14 +702,20 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
         console.warn('[Gemini Live] greeting send failed:', e);
       }
 
-      console.log(`[Gemini Live] Session established for call ${callId} (${model})`);
+      if (variant === 'minimal') {
+        plog('warn', 'gemini', 'connected with MINIMAL config — full config was rejected, see gemini_failed stages above', { callId });
+      }
+      console.log(`[Gemini Live] Session established for call ${callId} (${model} [${variant}])`);
       return true;
     } catch (err: any) {
-      setStage(callId, 'gemini_failed', `${model}: ${err?.message || err}`, 'error');
-      console.error(`[Gemini Live] Connect failed for model ${model}:`, err?.message || err);
-      notifySockets({ type: 'live_error', callId, model, error: err?.message || `Failed to connect ${model}` });
+      const errMsg = err?.message || String(err);
+      // Full-config failure is warn (minimal retry follows for the same
+      // model); minimal failure is error (that model is exhausted).
+      setStage(callId, 'gemini_failed', `${model} [${variant}]: ${errMsg}`, variant === 'minimal' ? 'error' : 'warn');
+      console.error(`[Gemini Live] Connect failed for model ${model} [${variant}]:`, errMsg);
     }
   }
+  notifySockets({ type: 'live_error', callId, error: 'Gemini Live unavailable — every model/config failed (see call timeline)' });
   return false;
 }
 
