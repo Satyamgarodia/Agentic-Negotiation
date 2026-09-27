@@ -34,6 +34,14 @@ const log = (level, msg, extra) => {
   if (level === 'error') console.error(line);
   else console.log(line);
 };
+// Short display form for long Meta `wacid.*` call IDs in log lines.
+// Call maps and API payloads always use the full ID.
+const shortId = (id) => {
+  if (!id) return '';
+  const s = String(id).replace(/^wacid[._-]?/i, '');
+  if (s.length <= 8) return s;
+  return `${s.slice(0, 4)}…${s.slice(-4)}`;
+};
 
 async function api(path, opts = {}) {
   const res = await fetch(`${SERVER}${path}`, {
@@ -130,14 +138,14 @@ const activeCalls = new Map(); // callId -> { pc, ws, cleanup }
 async function handleCall(job) {
   const { callId, sdpOffer, roomName } = job;
   if (activeCalls.has(callId)) return;
-  log('info', `bridging call ${callId} (room ${roomName})`);
+  log('info', `bridging call ${shortId(callId)} (room ${roomName})`);
   const t0 = Date.now();
 
   const pc = new RTCPeerConnection({
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   });
   pc.onconnectionstatechange = () => {
-    log('info', `pc state ${callId}: ${pc.connectionState}`);
+    log('info', `pc state ${shortId(callId)}: ${pc.connectionState}`);
     if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) cleanupCall(callId);
   };
 
@@ -170,11 +178,11 @@ async function handleCall(job) {
         feedCaller(up24to48(Buffer.from(msg.audio, 'base64')));
       }
     } catch (e) {
-      log('warn', `media ws parse error ${callId}`, { error: e?.message });
+      log('warn', `media ws parse error ${shortId(callId)}`, { error: e?.message });
     }
   });
   mediaWs.on('close', () => {
-    log('info', `media ws closed ${callId}`);
+    log('info', `media ws closed ${shortId(callId)}`);
     cleanupCall(callId);
   });
 
@@ -195,7 +203,7 @@ async function handleCall(job) {
       },
     });
   } catch (e) {
-    log('error', `bridge setup failed ${callId}`, { error: e?.message || String(e) });
+    log('error', `bridge setup failed ${shortId(callId)}`, { error: e?.message || String(e) });
     try { mediaWs.close(); } catch {}
     try { pc.close(); } catch {}
   }
@@ -206,7 +214,7 @@ function cleanupCall(callId) {
   if (!c) return;
   activeCalls.delete(callId);
   try { c.cleanup(); } catch {}
-  log('info', `call cleaned up ${callId}`);
+  log('info', `call cleaned up ${shortId(callId)}`);
 }
 
 // ---------------------------------------------------------------- main loops
@@ -223,7 +231,7 @@ async function pollPending() {
     const { pending } = await api('/api/bridge/pending');
     for (const job of pending || []) {
       if (!activeCalls.has(job.callId)) {
-        void handleCall(job).catch((e) => log('error', `handleCall ${job.callId}`, { error: e?.message }));
+        void handleCall(job).catch((e) => log('error', `handleCall ${shortId(job.callId)}`, { error: e?.message }));
       }
     }
   } catch (e) {

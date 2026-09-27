@@ -243,6 +243,16 @@ const logStreamClients = new Set<any>();
 const loggedFirstAudioIn = new Set<string>();
 const loggedFirstAudioOut = new Set<string>();
 
+// Short display form for call IDs (notably long Meta `wacid.*` IDs) so
+// console / Cloud Run log lines stay readable. The structured `callId` field
+// on the entry (and /api/logs, timeline) always keeps the full ID.
+function shortId(id?: string): string {
+  if (!id) return '';
+  const stripped = id.replace(/^wacid[._-]?/i, '');
+  if (stripped.length <= 8) return stripped;
+  return `${stripped.slice(0, 4)}…${stripped.slice(-4)}`;
+}
+
 function plog(level: LogLevel, stage: string, msg: string, opts?: { callId?: string; data?: any }) {
   const entry: LogEntry = {
     ts: new Date().toISOString(),
@@ -256,8 +266,9 @@ function plog(level: LogLevel, stage: string, msg: string, opts?: { callId?: str
   if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.splice(0, logBuffer.length - LOG_BUFFER_MAX);
 
   // Single-line console output for Cloud Run Logs Explorer.
+  // Tag uses the short ID; the full ID stays in the structured entry.
   const dataStr = opts?.data !== undefined ? ` :: ${JSON.stringify(opts.data)}` : '';
-  const line = `[${entry.ts}][${level.toUpperCase()}][${stage}]${entry.callId ? `[${entry.callId}]` : ''} ${msg}${dataStr}`;
+  const line = `[${entry.ts}][${level.toUpperCase()}][${stage}]${entry.callId ? `[${shortId(entry.callId)}]` : ''} ${msg}${dataStr}`;
   if (level === 'error') console.error(line);
   else if (level === 'warn') console.warn(line);
   else console.log(line);

@@ -44,6 +44,16 @@ const PIPELINE_STAGES = [
   'pickup_complete',
 ];
 
+// Short display form for call IDs (notably long Meta `wacid.*` IDs).
+// Strips the `wacid` prefix and keeps first 4 + last 4 chars so rows stay
+// readable. Full ID is kept in the filter haystack and in `title` hover.
+const shortId = (id?: string): string => {
+  if (!id) return '';
+  const stripped = id.replace(/^wacid[._-]?/i, '');
+  if (stripped.length <= 8) return stripped;
+  return `${stripped.slice(0, 4)}…${stripped.slice(-4)}`;
+};
+
 export const LogsTab: React.FC = () => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [paused, setPaused] = useState(false);
@@ -235,7 +245,7 @@ export const LogsTab: React.FC = () => {
                   {l.level.toUpperCase()}
                 </span>
                 <span className="shrink-0 text-purple-300">[{l.stage}]</span>
-                {l.callId && <span className="shrink-0 text-emerald-400">[{l.callId.slice(0, 24)}]</span>}
+                {l.callId && <span className="shrink-0 text-emerald-400" title={l.callId}>[{shortId(l.callId)}]</span>}
                 <span className={`${levelText[l.level]} break-all`}>
                   {l.msg}
                   {l.data !== undefined && (
