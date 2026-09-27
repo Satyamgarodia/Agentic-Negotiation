@@ -98,6 +98,7 @@ export interface CallSession {
   callerNumber: string;
   callerName: string;
   direction: 'inbound' | 'outbound';
+  origin?: 'telephony' | 'browser';
   status: 'ringing' | 'connected' | 'speaking' | 'interrupted' | 'ended';
   startedAt: string;
   endedAt?: string;
@@ -108,6 +109,9 @@ export interface CallSession {
   interruptionsCount: number;
   livekitRoom?: string;
   geminiConnected?: boolean;
+  // Full SDP offer from Meta, stored so a bridge worker can answer it.
+  // Never logged (length only).
+  sdpOffer?: string;
   pickupStage?: string;
   stageHistory?: Array<{ stage: string; ts: string; detail?: string }>;
   turns: Array<{
@@ -126,6 +130,53 @@ const geminiSessions: Map<string, any> = new Map();
 const geminiAudioOutbox: Map<string, string[]> = new Map();
 // LiveKit room info per call.
 const livekitRooms: Map<string, { roomName: string; agentToken: string; callerToken: string }> = new Map();
+
+// Headless bridge workers: UDP-capable processes that terminate WhatsApp RTP
+// audio and join the LiveKit room. Cloud Run can't do this itself (no UDP
+// ingress), so a worker (bridge-worker/) with a public IP does it instead.
+interface BridgeWorker {
+  id: string;
+  publicIp: string;
+  lastSeen: number;
+}
+const bridgeWorkers = new Map<string, BridgeWorker>();
+// callId -> SDP answer produced by a bridge worker, consumed by the pickup flow.
+const bridgeAnswers = new Map<string, string>();
+
+function pruneBridges() {
+  const now = Date.now();
+  for (const [id, b] of bridgeWorkers) {
+    if (now - b.lastSeen > 45000) {
+      bridgeWorkers.delete(id);
+      plog('warn', 'bridge', `worker ${id} stale (>45s) — removed`);
+    }
+  }
+}
+
+function liveBridge(): BridgeWorker | null {
+  pruneBridges();
+  const first = bridgeWorkers.values().next();
+  return first.done ? null : first.value;
+}
+
+function waitForBridgeAnswer(callId: string, timeoutMs: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      const ans = bridgeAnswers.get(callId);
+      if (ans) {
+        clearInterval(timer);
+        bridgeAnswers.delete(callId);
+        resolve(ans);
+        return;
+      }
+      if (Date.now() - start > timeoutMs) {
+        clearInterval(timer);
+        resolve(null);
+      }
+    }, 250);
+  });
+}
 const recentCalls: CallSession[] = [
   {
     id: 'call_seed_1',
@@ -451,7 +502,7 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
             call.geminiConnected = true;
             if (call.status === 'ringing') call.status = 'connected';
             notifySockets({ type: 'live_status', callId, status: 'connected', message: `${model} connected and listening.`, model });
-            notifySockets({ type: 'call_connected_meta', callId, roomName: call.livekitRoom || `wa_${callId}`, model });
+            notifySockets({ type: 'call_connected_meta', callId, roomName: call.livekitRoom || `wa_${callId}`, origin: call.origin || 'telephony', model });
           },
           onmessage: (message: any) => {
             const parts = message.serverContent?.modelTurn?.parts;
@@ -683,14 +734,15 @@ async function acceptMetaCall(
   phoneNumberId: string,
   sdpOffer: string,
   token: string,
+  sdpAnswerOverride?: string,
 ): Promise<string> {
-  const sdpAnswer = generateSdpAnswer(sdpOffer);
+  const sdpAnswer = sdpAnswerOverride || generateSdpAnswer(sdpOffer);
   const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${phoneNumberId}/calls`;
   const t0 = Date.now();
   // NOTE: token + full SDP are deliberately never logged.
   plog('info', 'meta', `POST accept call (sdp offer ${sdpOffer.length}B -> answer ${sdpAnswer.length}B)`, {
     callId,
-    data: { url, phoneNumberId, graphVersion: META_GRAPH_VERSION },
+    data: { url, phoneNumberId, graphVersion: META_GRAPH_VERSION, answeredBy: sdpAnswerOverride ? 'bridge-worker' : 'server' },
   });
   console.log(`[Meta Cloud API] Accepting WhatsApp call ${callId} via ${url} ...`);
   const res = await fetch(url, {
@@ -724,6 +776,7 @@ async function processIncomingCall(opts: {
   callerName: string;
   sdpOffer: string;
   phoneNumberId: string;
+  origin?: 'telephony' | 'browser';
 }) {
   const { callId, caller, callerName, sdpOffer, phoneNumberId } = opts;
   const pipeStart = Date.now();
@@ -736,6 +789,7 @@ async function processIncomingCall(opts: {
       callerNumber: caller,
       callerName,
       direction: 'inbound',
+      origin: opts.origin || 'telephony',
       status: 'ringing',
       startedAt: new Date().toISOString(),
       durationSeconds: 0,
@@ -747,6 +801,8 @@ async function processIncomingCall(opts: {
     };
     callSessions.set(callId, call);
   }
+  // Keep the latest SDP offer for the bridge worker (never logged in full).
+  if (sdpOffer) call.sdpOffer = sdpOffer;
 
   // 1. LiveKit room for this call (media gateway orchestration over TCP/TLS).
   setStage(callId, 'livekit_start');
@@ -756,6 +812,23 @@ async function processIncomingCall(opts: {
     setStage(callId, 'livekit_ready', room.roomName);
   } else {
     setStage(callId, 'livekit_skipped', 'continuing without room — direct Gemini bridge only', 'warn');
+  }
+
+  // 1b. Headless audio: if a UDP-capable bridge worker is alive, it terminates
+  // the WhatsApp RTP, joins the LiveKit room, and pipes audio to Gemini. Wait
+  // briefly for its SDP answer; otherwise fall back to the server SDP.
+  const worker = liveBridge();
+  let bridgeAnswer: string | null = null;
+  if (worker && sdpOffer) {
+    setStage(callId, 'waiting_bridge', `worker ${worker.id} @ ${worker.publicIp || 'unknown-ip'}`);
+    bridgeAnswer = await waitForBridgeAnswer(callId, 9000);
+    if (bridgeAnswer) {
+      setStage(callId, 'bridge_answered', `SDP answer from worker ${worker.id} (${bridgeAnswer.length}B)`);
+    } else {
+      setStage(callId, 'bridge_timeout', 'no worker answer in 9s — falling back to server SDP', 'warn');
+    }
+  } else if (sdpOffer && !worker) {
+    plog('debug', 'pickup', 'no bridge worker alive — server answers SDP directly (audio needs UDP bridge/Twilio path)', { callId });
   }
 
   notifySockets({
@@ -783,7 +856,7 @@ async function processIncomingCall(opts: {
   let acceptStatus = 'waiting_for_media_bridge';
   if (token && sdpOffer && phoneNumberId) {
     try {
-      acceptStatus = await acceptMetaCall(callId, phoneNumberId, sdpOffer, token);
+      acceptStatus = await acceptMetaCall(callId, phoneNumberId, sdpOffer, token, bridgeAnswer || undefined);
       if (acceptStatus.startsWith('accepted')) {
         call.status = 'connected';
       }
@@ -805,6 +878,7 @@ async function processIncomingCall(opts: {
     type: 'call_connected_meta',
     callId,
     roomName: room?.roomName || `wa_${callId}`,
+    origin: call.origin || 'telephony',
     acceptStatus,
     geminiConnected: geminiOk,
   });
@@ -821,6 +895,7 @@ async function processIncomingCall(opts: {
 
 function endCall(callId: string, reason = 'ended') {
   const call = callSessions.get(callId);
+  const endedOrigin = call?.origin || 'telephony';
   if (call) {
     const secs = Math.round((Date.now() - new Date(call.startedAt).getTime()) / 1000);
     plog('info', 'pickup', `call ended: reason=${reason}, duration≈${secs}s`, {
@@ -847,7 +922,7 @@ function endCall(callId: string, reason = 'ended') {
     roomService.deleteRoom(room.roomName).catch(() => {});
     livekitRooms.delete(callId);
   }
-  notifySockets({ type: 'call_ended', callId, reason });
+  notifySockets({ type: 'call_ended', callId, reason, origin: endedOrigin });
 }
 
 // REST API Endpoints
@@ -1004,7 +1079,7 @@ app.post('/api/whatsapp/webhook', (req: Request, res: Response) => {
     autoAccept: gatewayConfig.autoAcceptCalls,
   });
 
-  void processIncomingCall({ callId, caller, callerName, sdpOffer, phoneNumberId })
+  void processIncomingCall({ callId, caller, callerName, sdpOffer, phoneNumberId, origin: 'telephony' })
     .catch((err) => console.error('[Pickup] pipeline failed:', err));
 });
 
@@ -1063,6 +1138,7 @@ app.post('/api/whatsapp/simulate-call', async (req: Request, res: Response) => {
     callerName: callerName || 'Marcus Vance',
     sdpOffer: '',
     phoneNumberId: gatewayConfig.phoneNumberId,
+    origin: 'browser',
   });
 
   res.json({ success: true, call: callSessions.get(callId), pickup: result });
@@ -1082,6 +1158,7 @@ app.post('/api/calls/:id/accept', async (req: Request, res: Response) => {
     callerName: call.callerName,
     sdpOffer: '',
     phoneNumberId: gatewayConfig.phoneNumberId,
+    origin: call.origin || 'browser',
   });
   res.json({ success: true, call: callSessions.get(id), pickup: result });
 });
@@ -1146,6 +1223,61 @@ app.get('/api/calls/:id/timeline', (req: Request, res: Response) => {
   }
   const logs = logBuffer.filter((e) => e.callId === req.params.id);
   res.json({ call, logs });
+});
+
+// 10. Bridge worker API. A bridge worker is a UDP-capable process
+// (see bridge-worker/) that terminates WhatsApp RTP audio, joins the
+// LiveKit room, and pipes audio to/from Gemini over /ws/call-media/:callId.
+// This is what makes calls fully headless — no browser involved.
+app.post('/api/bridge/heartbeat', (req: Request, res: Response) => {
+  const { workerId, publicIp } = req.body || {};
+  if (!workerId) {
+    res.status(400).json({ error: 'Missing workerId' });
+    return;
+  }
+  bridgeWorkers.set(workerId, { id: workerId, publicIp: publicIp || '', lastSeen: Date.now() });
+  pruneBridges();
+  plog('debug', 'bridge', `heartbeat from worker ${workerId}`, { data: { publicIp: publicIp || null } });
+  res.json({ ok: true, workers: bridgeWorkers.size });
+});
+
+// Calls waiting for a bridge worker to answer their SDP offer.
+app.get('/api/bridge/pending', (req: Request, res: Response) => {
+  pruneBridges();
+  const wsBase = PUBLIC_BASE_URL.replace(/^http/, 'ws');
+  const pending = [];
+  for (const call of callSessions.values()) {
+    if (!call.sdpOffer || call.status === 'ended') continue;
+    if (!['pickup_started', 'livekit_ready', 'waiting_bridge'].includes(call.pickupStage || '')) continue;
+    const room = livekitRooms.get(call.id);
+    pending.push({
+      callId: call.id,
+      caller: call.callerNumber,
+      callerName: call.callerName,
+      sdpOffer: call.sdpOffer,
+      roomName: room?.roomName || `wa_${call.id}`,
+      livekitUrl: livekitConfigured ? livekitUrl : null,
+      agentToken: room?.agentToken || null,
+      callMediaWs: `${wsBase}/ws/call-media/${encodeURIComponent(call.id)}`,
+    });
+  }
+  res.json({ pending });
+});
+
+// Bridge worker submits the SDP answer it generated for a call.
+app.post('/api/bridge/answer', (req: Request, res: Response) => {
+  const { callId, sdpAnswer, workerId } = req.body || {};
+  if (!callId || !sdpAnswer) {
+    res.status(400).json({ error: 'Missing callId/sdpAnswer' });
+    return;
+  }
+  if (!callSessions.has(callId)) {
+    res.status(404).json({ error: 'Call not found (may have ended)' });
+    return;
+  }
+  bridgeAnswers.set(callId, sdpAnswer);
+  plog('info', 'bridge', `SDP answer received from worker ${workerId || '?'} (${sdpAnswer.length}B)`, { callId });
+  res.json({ ok: true });
 });
 
 // 8. End Call
@@ -1398,6 +1530,7 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
               callerNumber: message.callerNumber || '+1 (555) 382-9428',
               callerName: message.callerName || 'Alex Chen',
               direction: message.direction || 'inbound',
+              origin: 'browser',
               status: 'connected',
               startedAt: new Date().toISOString(),
               durationSeconds: 0,
@@ -1614,6 +1747,7 @@ wssMediaStream.on('connection', async (telephonyWs: WebSocket) => {
         callerNumber: 'Twilio Caller',
         callerName: 'WhatsApp Caller (Twilio)',
         direction: 'inbound',
+        origin: 'telephony',
         status: 'connected',
         startedAt: new Date().toISOString(),
         durationSeconds: 0,

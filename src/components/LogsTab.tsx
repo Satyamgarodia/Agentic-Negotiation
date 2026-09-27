@@ -35,6 +35,8 @@ const levelBadge: Record<string, string> = {
 const PIPELINE_STAGES = [
   'pickup_started',
   'livekit_ready',
+  'waiting_bridge',
+  'bridge_answered',
   'gemini_connected',
   'meta_accepted',
   'media_flowing_in',

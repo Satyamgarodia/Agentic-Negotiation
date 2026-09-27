@@ -51,6 +51,9 @@ You have access to tools for checking orders, scheduling appointments, and trans
   });
 
   const [recentCalls, setRecentCalls] = useState<CallSession[]>([]);
+  // Real WhatsApp calls handled headlessly by AI (server-side). These NEVER
+  // touch the phone mockup — shown as a passive banner only.
+  const [liveAiCall, setLiveAiCall] = useState<CallSession | null>(null);
 
   // Audio subsystem references
   const ringtoneRef = useRef<WhatsAppRingtone | null>(null);
@@ -117,8 +120,14 @@ You have access to tools for checking orders, scheduling appointments, and trans
 
         switch (data.type) {
           case 'incoming_call_event': {
-            // An incoming WhatsApp call event arrived (via Webhook or trigger)
+            // Browser-simulated calls ring the mockup. Real telephony calls
+            // are handled headlessly by AI — banner only, no ringtone.
             const incoming = data.call;
+            if (incoming.origin === 'telephony') {
+              console.log('[App] Headless AI call in progress:', incoming.id);
+              setLiveAiCall(incoming);
+              break;
+            }
             setActiveCallId(incoming.id);
             setCallerName(incoming.callerName);
             setCallerNumber(incoming.callerNumber);
@@ -131,8 +140,15 @@ You have access to tools for checking orders, scheduling appointments, and trans
           }
 
           case 'call_connected_meta': {
-            // Meta Cloud API Call was accepted
+            // Browser call accepted -> mockup goes live. Headless AI call ->
+            // banner update only, mockup stays idle.
             console.log('[App] Meta Cloud API call auto-accepted:', data);
+            if (data.origin === 'telephony') {
+              setLiveAiCall((prev) =>
+                prev && prev.id === data.callId ? { ...prev, status: 'connected' as CallStatus } : prev
+              );
+              break;
+            }
             ringtoneRef.current?.stop();
             setCallStatus('connected');
             break;
@@ -207,6 +223,10 @@ You have access to tools for checking orders, scheduling appointments, and trans
           }
 
           case 'call_ended': {
+            if (data.origin === 'telephony') {
+              setLiveAiCall((prev) => (prev && prev.id === data.callId ? null : prev));
+              break;
+            }
             handleCallEndedLocally();
             break;
           }
@@ -334,6 +354,7 @@ You have access to tools for checking orders, scheduling appointments, and trans
         callerName,
         callerNumber,
         direction: 'inbound',
+        origin: 'browser',
         status: 'ended',
         startedAt: new Date(Date.now() - durationSeconds * 1000).toISOString(),
         endedAt: new Date().toISOString(),
@@ -434,6 +455,26 @@ You have access to tools for checking orders, scheduling appointments, and trans
         businessPhoneNumber={config.businessPhoneNumber}
         hasApiKey={hasApiKey}
       />
+
+      {/* Headless AI call banner — real WhatsApp call, no human needed */}
+      {liveAiCall && callStatus === 'idle' && (
+        <div className="px-4 sm:px-6 lg:px-8 pt-4 max-w-7xl mx-auto w-full">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 px-4 py-3 rounded-2xl bg-emerald-950/40 border border-emerald-500/30">
+            <div className="flex items-center gap-2.5 text-sm">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+              <span className="text-emerald-200">
+                <strong>AI is on a WhatsApp call</strong> with {liveAiCall.callerName} ({liveAiCall.callerNumber}) — audio flows WhatsApp ↔ LiveKit room ↔ Gemini, fully automatic. No action needed.
+              </span>
+            </div>
+            <button
+              onClick={() => setActiveTab('logs')}
+              className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs shrink-0 cursor-pointer"
+            >
+              Watch live logs
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Main Tab View */}
       <main className="flex-1 px-4 sm:px-6 lg:px-8 py-6 max-w-7xl mx-auto w-full">

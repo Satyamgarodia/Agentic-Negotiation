@@ -11,6 +11,7 @@ export interface CallSession {
   callerNumber: string;
   callerName: string;
   direction: 'inbound' | 'outbound';
+  origin?: 'telephony' | 'browser';
   status: CallStatus;
   startedAt: string;
   endedAt?: string;

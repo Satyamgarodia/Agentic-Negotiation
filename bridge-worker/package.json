@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-bridge-worker",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Headless UDP audio bridge: terminates WhatsApp WebRTC RTP and pipes it to the Gemini Live gateway. No browser involved.",
+  "scripts": {
+    "start": "node worker.js",
+    "self-test": "node worker.js --self-test"
+  },
+  "dependencies": {
+    "werift": "latest",
+    "ws": "^8.21.3"
+  }
+}
