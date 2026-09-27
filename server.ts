@@ -546,6 +546,21 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
               call.status = 'interrupted';
               call.interruptionsCount += 1;
               notifySockets({ type: 'interrupted', callId, origin: call.origin || 'telephony', message: 'Gemini output halted by caller speech' });
+              // Barge-in must also stop audio already delivered to telephony.
+              // The worker holds up to seconds of buffered Gemini speech that
+              // would otherwise keep playing over the caller — flush it there
+              // and discard anything still queued here.
+              geminiAudioOutbox.set(callId, []);
+              const bridges = callMediaBridges.get(callId);
+              if (bridges) {
+                for (const client of bridges) {
+                  try {
+                    if (client.readyState === WebSocket.OPEN) {
+                      client.send(JSON.stringify({ type: 'flush_audio', callId }));
+                    }
+                  } catch { /* ignore per-bridge errors */ }
+                }
+              }
               setTimeout(() => {
                 if (call.status === 'interrupted') call.status = 'connected';
               }, 800);

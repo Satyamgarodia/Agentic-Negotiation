@@ -252,13 +252,14 @@ function makeFeeder(source, label) {
         pendingPcm = pendingPcm.subarray(960);
         added++;
       }
-      // Cap at ~3s of queued Gemini audio. Gemini delivers speech in bursts
-      // faster than realtime, so the queue legitimately holds 1-2s during a
-      // long reply — a smaller cap (e.g. 500ms) chops speech into gaps.
-      // Drop oldest past the cap so playback stays live after a real stall.
-      if (frames.length > 300) {
-        droppedFrames += frames.length - 300;
-        frames.splice(0, frames.length - 300);
+      // Generous cap (~10s): Gemini delivers speech in bursts faster than
+      // realtime, so the queue legitimately holds seconds of audio during a
+      // long reply. NEVER chop live speech here — drops are last-resort
+      // safety for a real stall only. Barge-in staleness is handled by
+      // flush(), not by this cap.
+      if (frames.length > 1000) {
+        droppedFrames += frames.length - 1000;
+        frames.splice(0, frames.length - 1000);
         if (droppedFrames <= 3 || droppedFrames % 100 === 0) {
           log('warn', `${label}: dropped stale outbound frames to stay live`, { droppedFrames });
         }
@@ -277,6 +278,16 @@ function makeFeeder(source, label) {
     }
   };
   enqueue.stop = () => clearInterval(timer);
+  // Barge-in: the caller interrupted Gemini — discard already-buffered
+  // speech (up to seconds of it) so the stale reply stops immediately
+  // instead of playing out. The sub-10ms partial remainder goes too;
+  // inaudible, keeps the stream cleanly aligned.
+  enqueue.flush = () => {
+    const n = frames.length;
+    frames.length = 0;
+    pendingPcm = Buffer.alloc(0);
+    if (n > 0) log('info', `${label}: flushed ${n} queued outbound frames on barge-in`);
+  };
   enqueue.stats = () => ({ queuedFrames: frames.length, fedFrames, feedErrors, enqueuedChunks, droppedFrames, pendingBytes: pendingPcm.length });
   return enqueue;
 }
@@ -390,6 +401,10 @@ async function handleCall(job) {
   mediaWs.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
+      if (msg.type === 'flush_audio') {
+        feedCaller.flush();
+        return;
+      }
       if (msg.type === 'gemini_audio' && msg.audio) {
         geminiMsgs++;
         if (geminiMsgs <= 3 || geminiMsgs % 50 === 0) {
