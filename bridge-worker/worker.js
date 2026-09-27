@@ -33,6 +33,10 @@ const WORKER_ID = process.env.WORKER_ID || `bridge-${os.hostname()}`;
 const PUBLIC_IP = process.env.PUBLIC_IP || '';
 const SELF_TEST = process.argv.includes('--self-test');
 const DEBUG_AUDIO = process.env.AUDIO_DEBUG === '1' || SELF_TEST;
+// TONE_TEST=1: feed a continuous 440Hz tone instead of Gemini audio.
+// Killer diagnostic: if the caller hears the tone, outbound RTP works and the
+// bug is upstream (Gemini silence). If not, the bug is transport. Unset after.
+const TONE_TEST = process.env.TONE_TEST === '1';
 
 const log = (level, msg, extra) => {
   const line = `[bridge][${level}][${WORKER_ID}] ${msg}${extra !== undefined ? ' :: ' + JSON.stringify(extra) : ''}`;
@@ -98,6 +102,57 @@ function tone48k(seconds, freq = 440) {
   return out;
 }
 
+// Force IPv4: Meta offers IPv4 + IPv6 host candidates. A v6 nomination can
+// show pc 'connected' while the v4 media path Meta actually uses stays dead.
+function stripIpv6Candidates(sdp) {
+  const lines = String(sdp).split('\r\n');
+  const kept = lines.filter((l) => {
+    if (!l.startsWith('a=candidate:')) return true;
+    const ip = l.split(' ')[4] || '';
+    return !ip.includes(':');
+  });
+  return { sdp: kept.join('\r\n'), removed: lines.length - kept.length };
+}
+
+// Bounded wait for srflx gathering so the SDP answer carries a reachable
+// public candidate instead of host-only.
+function waitForIceGathering(pc, timeoutMs = 2500) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        if (typeof pc.removeEventListener === 'function') pc.removeEventListener('icegatheringstatechange', onChange);
+      } catch {}
+      resolve();
+    };
+    const onChange = () => {
+      if (pc.iceGatheringState === 'complete') finish();
+    };
+    try {
+      if (typeof pc.addEventListener === 'function') pc.addEventListener('icegatheringstatechange', onChange);
+      else pc.onicegatheringstatechange = onChange;
+    } catch { finish(); return; }
+    const timer = setTimeout(finish, timeoutMs);
+  });
+}
+
+// Log only signaling-shape lines (m=/c=/mid/direction/rtpmap/candidate).
+// Never logs ufrag/pwd/fingerprint values.
+function logSdpSummary(sdp, callId, tag) {
+  try {
+    const interesting = String(sdp).split('\r\n').filter((l) =>
+      /^(m=audio|c=IN|a=mid:|a=sendrecv|a=sendonly|a=recvonly|a=inactive|a=rtpmap:|a=candidate:|a=rtcp-mux|a=group:)/.test(l));
+    const mLines = interesting.filter((l) => l.startsWith('m=')).length;
+    log('info', `${shortId(callId)}: ${tag} SDP summary (${String(sdp).length}B, ${mLines} m-line(s))`, { lines: interesting });
+  } catch (e) {
+    log('warn', `${shortId(callId)}: ${tag} SDP summary failed`, { error: e?.message || String(e) });
+  }
+}
+
 // ---------------------------------------------------------------- media wiring
 // Feeds decoded caller PCM into onPcm16k. Returns cleanup fn.
 // NOTE (unverified API surface): if RTCAudioSink/RTCAudioSource shapes differ
@@ -114,6 +169,12 @@ function attachSink(peerConnection, onPcm16k, label) {
         log('info', `${label}: first audio frame shape`, {
           isBuffer: Buffer.isBuffer(frame),
           keys: frame && typeof frame === 'object' ? Object.keys(frame) : typeof frame,
+          sampleRate: frame?.sampleRate ?? null,
+          channelCount: frame?.channelCount ?? null,
+          bitsPerSample: frame?.bitsPerSample ?? null,
+          numberOfFrames: frame?.numberOfFrames ?? null,
+          samplesLength: frame?.samples?.length ?? null,
+          type: frame?.type ?? null,
         });
       }
       const pcm16 = sinkFrameToPcm16k(frame);
@@ -131,6 +192,9 @@ function makeFeeder(source, label) {
   let pendingPcm = Buffer.alloc(0);
   let firstQueued = true;
   let firstSent = true;
+  let fedFrames = 0;
+  let feedErrors = 0;
+  let enqueuedChunks = 0;
   // RTCAudioSource requires real-time 10ms delivery. Continuous silence keeps
   // the WhatsApp RTP stream alive between Gemini speech chunks.
   const timer = setInterval(() => {
@@ -143,12 +207,14 @@ function makeFeeder(source, label) {
         channelCount: 1,
         numberOfFrames: 480,
       });
+      fedFrames++;
       if (firstSent) {
         firstSent = false;
         log('info', `${label}: outbound RTP audio pump started`);
       }
     } catch (e) {
-      log('error', `${label}: RTCAudioSource feed failed`, { error: e?.message || String(e) });
+      feedErrors++;
+      if (feedErrors <= 3) log('error', `${label}: RTCAudioSource feed failed`, { error: e?.message || String(e) });
     }
   }, 10);
 
@@ -158,6 +224,7 @@ function makeFeeder(source, label) {
       // Gemini chunks are not guaranteed to align to 10ms WebRTC frames.
       // Preserve the remainder so sub-frame chunks are never discarded.
       pendingPcm = Buffer.concat([pendingPcm, pcm48k]);
+      enqueuedChunks++;
       let added = 0;
       while (pendingPcm.length >= 960) {
         // Copy each slice so it has exactly 480 samples / 960 B.
@@ -180,6 +247,7 @@ function makeFeeder(source, label) {
     }
   };
   enqueue.stop = () => clearInterval(timer);
+  enqueue.stats = () => ({ queuedFrames: frames.length, fedFrames, feedErrors, enqueuedChunks, pendingBytes: pendingPcm.length });
   return enqueue;
 }
 
@@ -198,10 +266,16 @@ async function handleCall(job) {
   // WhatsApp offers one audio m-line. Put both directions on the same
   // transceiver; separate recvonly/sendonly transceivers leave the source
   // track unassociated with Meta's sole negotiated m-line.
+  // NOTE: created BEFORE setRemoteDescription so it binds to Meta's m-line
+  // instead of opening a second one. The post-connected diagnostics below
+  // verify this (transceiver count, m-lines, currentDirection).
   const source = new RTCAudioSource();
   const sendTrack = source.createTrack();
   const audioTransceiver = pc.addTransceiver(sendTrack, { direction: 'sendrecv' });
   const feedCaller = makeFeeder(source, callId);
+  let geminiMsgs = 0;
+  let toneTimer = null;
+  let diagTimer = null;
 
   let statsLogged = false;
   pc.onconnectionstatechange = () => {
@@ -215,15 +289,30 @@ async function handleCall(job) {
     setTimeout(async () => {
       try {
         const stats = await pc.getStats();
-        const outbound = Array.from(stats.values()).find((s) => s.type === 'outbound-rtp' && (s.kind === 'audio' || s.mediaType === 'audio'));
-        log('info', `${shortId(callId)}: outbound audio stats`, {
+        const all = Array.from(stats.values());
+        const summary = all.map((s) => ({
+          type: s.type,
+          kind: s.kind ?? s.mediaType ?? null,
+          packetsSent: s.packetsSent ?? null,
+          bytesSent: s.bytesSent ?? null,
+          packetsReceived: s.packetsReceived ?? null,
+          state: s.state ?? null,
+          nominated: s.nominated ?? null,
+        }));
+        const types = summary.reduce((acc, s) => { acc[s.type] = (acc[s.type] || 0) + 1; return acc; }, {});
+        const outbound = all.find((s) => s.type === 'outbound-rtp' && ((s.kind ?? s.mediaType) === 'audio' || s.kind === undefined));
+        log('info', `${shortId(callId)}: audio stats dump`, {
           direction: audioTransceiver.direction,
           currentDirection: audioTransceiver.currentDirection,
-          packetsSent: outbound?.packetsSent ?? null,
-          bytesSent: outbound?.bytesSent ?? null,
+          transceivers: typeof pc.getTransceivers === 'function'
+            ? pc.getTransceivers().map((t) => ({ direction: t.direction, currentDirection: t.currentDirection, mid: t.mid ?? null }))
+            : null,
+          statTypes: types,
+          outboundAudio: outbound ? { packetsSent: outbound.packetsSent ?? null, bytesSent: outbound.bytesSent ?? null } : null,
+          entries: summary,
         });
       } catch (e) {
-        log('warn', `${shortId(callId)}: could not read outbound audio stats`, { error: e?.message || String(e) });
+        log('warn', `${shortId(callId)}: could not read audio stats`, { error: e?.message || String(e) });
       }
     }, 3000);
   };
@@ -245,6 +334,11 @@ async function handleCall(job) {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'gemini_audio' && msg.audio) {
+        geminiMsgs++;
+        if (geminiMsgs <= 3 || geminiMsgs % 50 === 0) {
+          log('info', `${shortId(callId)}: gemini_audio #${geminiMsgs} received`, { bytes: String(msg.audio).length });
+        }
+        if (TONE_TEST) return; // tone loop owns the feeder in test mode
         feedCaller(up24to48(Buffer.from(msg.audio, 'base64')));
       }
     } catch (e) {
@@ -258,16 +352,52 @@ async function handleCall(job) {
 
   try {
     await wsReady;
-    await pc.setRemoteDescription({ type: 'offer', sdp: sdpOffer });
+    // Force IPv4: Meta offers IPv4 + IPv6 host candidates. A v6 nomination can
+    // show 'connected' while the v4 media path Meta actually uses stays dead.
+    const stripped = stripIpv6Candidates(sdpOffer);
+    if (stripped.removed > 0) log('info', `${shortId(callId)}: stripped ${stripped.removed} IPv6 candidate line(s) from offer`);
+    logSdpSummary(stripped.sdp, callId, 'offer');
+    await pc.setRemoteDescription({ type: 'offer', sdp: stripped.sdp });
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
+    // Wait (bounded) for srflx gathering so the answer carries a reachable
+    // public candidate instead of host-only.
+    await waitForIceGathering(pc, 2500);
     const sdpAnswer = pc.localDescription?.sdp || answer.sdp;
+    logSdpSummary(sdpAnswer, callId, 'answer');
     await api('/api/bridge/answer', { method: 'POST', body: { callId, sdpAnswer, workerId: WORKER_ID } });
     log('info', `SDP answer submitted for ${callId} in ${Date.now() - t0}ms`);
+    if (TONE_TEST) {
+      // Killer test: continuous 440Hz tone owns the feeder all call long.
+      // If the caller hears it, outbound RTP works and the bug is upstream
+      // (Gemini silence). If not, the bug is transport. Unset TONE_TEST after.
+      const tone = tone48k(1);
+      let off = 0;
+      log('warn', `${shortId(callId)}: TONE_TEST=1 — feeding continuous tone, ignoring Gemini audio`);
+      toneTimer = setInterval(() => {
+        for (let i = 0; i < 2; i++) {
+          feedCaller(tone.subarray(off, off + 960));
+          off = (off + 960) % tone.length;
+        }
+      }, 20);
+    }
+    // Per-call counters every 5s: the only window into a long silent stretch.
+    diagTimer = setInterval(() => {
+      try {
+        log('info', `${shortId(callId)}: call counters`, {
+          geminiMsgs,
+          ...feedCaller.stats(),
+          wsOpen: mediaWs.readyState === WebSocket.OPEN,
+          pcState: pc.connectionState,
+        });
+      } catch {}
+    }, 5000);
     activeCalls.set(callId, {
       pc,
       ws: mediaWs,
       cleanup: () => {
+        if (toneTimer) clearInterval(toneTimer);
+        if (diagTimer) clearInterval(diagTimer);
         feedCaller.stop();
         try { mediaWs.close(); } catch {}
         try { pc.close(); } catch {}
@@ -275,6 +405,8 @@ async function handleCall(job) {
     });
   } catch (e) {
     log('error', `bridge setup failed ${shortId(callId)}`, { error: e?.message || String(e) });
+    if (toneTimer) clearInterval(toneTimer);
+    if (diagTimer) clearInterval(diagTimer);
     feedCaller.stop();
     try { mediaWs.close(); } catch {}
     try { pc.close(); } catch {}
