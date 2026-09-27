@@ -128,6 +128,7 @@ function attachSink(peerConnection, onPcm16k, label) {
 
 function makeFeeder(source, label) {
   const frames = [];
+  let pendingPcm = Buffer.alloc(0);
   let firstQueued = true;
   let firstSent = true;
   // RTCAudioSource requires real-time 10ms delivery. Continuous silence keeps
@@ -154,12 +155,18 @@ function makeFeeder(source, label) {
   const enqueue = (pcm48k) => {
     try {
       // werift RTCAudioSource push API — validated by --self-test.
-      for (let offset = 0; offset + 960 <= pcm48k.length; offset += 960) {
+      // Gemini chunks are not guaranteed to align to 10ms WebRTC frames.
+      // Preserve the remainder so sub-frame chunks are never discarded.
+      pendingPcm = Buffer.concat([pendingPcm, pcm48k]);
+      let added = 0;
+      while (pendingPcm.length >= 960) {
         // Copy each slice so it has exactly 480 samples / 960 B.
-        frames.push(Int16Array.from(new Int16Array(pcm48k.buffer, pcm48k.byteOffset + offset, 480)));
+        frames.push(Int16Array.from(new Int16Array(pendingPcm.buffer, pendingPcm.byteOffset, 480)));
+        pendingPcm = pendingPcm.subarray(960);
+        added++;
       }
       if (frames.length > 500) frames.splice(0, frames.length - 500); // cap latency at 5s
-      if (firstQueued) {
+      if (firstQueued && added > 0) {
         firstQueued = false;
         log('info', `${label}: first Gemini PCM queued for caller`, { queuedFrames: frames.length });
       }
