@@ -21,7 +21,12 @@
  */
 import os from 'node:os';
 import WebSocket from 'ws';
-import { RTCPeerConnection, RTCAudioSink, RTCAudioSource } from 'werift';
+// `werift` exposes RTP packets, not decoded/injectable PCM audio sources.
+// The bridge needs the native Node audio helpers exposed by @roamhq/wrtc.
+import wrtc from '@roamhq/wrtc';
+
+const { RTCPeerConnection, nonstandard } = wrtc;
+const { RTCAudioSink, RTCAudioSource } = nonstandard;
 
 const SERVER = (process.env.SERVER_URL || 'http://localhost:3000').replace(/\/$/, '');
 const WORKER_ID = process.env.WORKER_ID || `bridge-${os.hostname()}`;
@@ -54,18 +59,23 @@ async function api(path, opts = {}) {
 }
 
 // ---------------------------------------------------------------- PCM helpers (s16le mono)
-function toBuffer(frame) {
-  if (!frame) return null;
-  if (Buffer.isBuffer(frame)) return frame;
-  if (Buffer.isBuffer(frame.data)) return frame.data;
-  if (Buffer.isBuffer(frame.samples)) return frame.samples;
-  return null;
-}
-// 48kHz -> 16kHz (caller audio -> Gemini)
-function down48to16(buf) {
-  const n = Math.floor(buf.length / 2 / 3);
+function sinkFrameToPcm16k(frame) {
+  if (!frame?.samples || !(frame.samples instanceof Int16Array)) return null;
+  const sampleRate = frame.sampleRate || 48000;
+  const channels = frame.channelCount || 1;
+  const ratio = sampleRate / 16000;
+  if (!Number.isInteger(ratio)) {
+    log('warn', 'unsupported incoming audio sample rate', { sampleRate, channels });
+    return null;
+  }
+  const n = Math.floor(frame.samples.length / channels / ratio);
   const out = Buffer.alloc(n * 2);
-  for (let i = 0; i < n; i++) out.writeInt16LE(buf.readInt16LE(i * 6), i * 2);
+  for (let i = 0; i < n; i++) {
+    const base = Math.floor(i * ratio) * channels;
+    let sample = 0;
+    for (let channel = 0; channel < channels; channel++) sample += frame.samples[base + channel];
+    out.writeInt16LE(Math.round(sample / channels), i * 2);
+  }
   return out;
 }
 // 24kHz -> 48kHz (Gemini voice -> caller)
@@ -93,8 +103,8 @@ function tone48k(seconds, freq = 440) {
 // NOTE (unverified API surface): if RTCAudioSink/RTCAudioSource shapes differ
 // in your installed werift version, --self-test fails fast with the exact
 // mismatch — paste it back and the call below gets corrected in one round.
-function attachSink(transceiver, onPcm16k, label) {
-  transceiver.onTrack.subscribe((track) => {
+function attachSink(peerConnection, onPcm16k, label) {
+  peerConnection.ontrack = ({ track }) => {
     log('info', `${label}: incoming track`, { kind: track.kind });
     const sink = new RTCAudioSink(track);
     let first = true;
@@ -106,21 +116,29 @@ function attachSink(transceiver, onPcm16k, label) {
           keys: frame && typeof frame === 'object' ? Object.keys(frame) : typeof frame,
         });
       }
-      const pcm48 = toBuffer(frame);
-      if (!pcm48) {
+      const pcm16 = sinkFrameToPcm16k(frame);
+      if (!pcm16) {
         if (DEBUG_AUDIO) log('warn', `${label}: unrecognized frame, skipping`);
         return;
       }
-      onPcm16k(down48to16(pcm48));
+      onPcm16k(pcm16);
     };
-  });
+  };
 }
 
 function makeFeeder(source, label) {
   return (pcm48k) => {
     try {
       // werift RTCAudioSource push API — validated by --self-test.
-      source.ondata(pcm48k);
+      for (let offset = 0; offset + 960 <= pcm48k.length; offset += 960) {
+        source.onData({
+          samples: new Int16Array(pcm48k.buffer, pcm48k.byteOffset + offset, 480),
+          sampleRate: 48000,
+          bitsPerSample: 16,
+          channelCount: 1,
+          numberOfFrames: 480,
+        });
+      }
     } catch (e) {
       log('error', `${label}: RTCAudioSource feed failed`, {
         error: e?.message || String(e),
@@ -165,7 +183,7 @@ async function handleCall(job) {
     mediaWs.on('error', reject);
   });
 
-  attachSink(recvT, (pcm16k) => {
+  attachSink(pc, (pcm16k) => {
     if (mediaWs.readyState === WebSocket.OPEN) {
       mediaWs.send(JSON.stringify({ type: 'caller_audio', callId, audio: pcm16k.toString('base64') }));
     }
@@ -256,7 +274,7 @@ async function selfTest() {
 
   let frames = 0;
   let bytes = 0;
-  attachSink(recvT, (pcm16k) => {
+  attachSink(receiver, (pcm16k) => {
     frames++;
     bytes += pcm16k.length;
   }, 'self-test');

@@ -9,7 +9,7 @@
     "self-test": "node worker.js --self-test"
   },
   "dependencies": {
-    "werift": "latest",
+    "@roamhq/wrtc": "^0.10.0",
     "ws": "^8.21.3"
   }
 }
