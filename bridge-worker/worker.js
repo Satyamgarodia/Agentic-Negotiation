@@ -169,13 +169,12 @@ async function handleCall(job) {
     if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) cleanupCall(callId);
   };
 
-  // Caller audio -> Gemini (via gateway WS)
-  const recvT = pc.addTransceiver('audio', { direction: 'recvonly' });
-
-  // Gemini voice -> caller
+  // WhatsApp offers one audio m-line. Put both directions on the same
+  // transceiver; separate recvonly/sendonly transceivers leave the source
+  // track unassociated with Meta's sole negotiated m-line.
   const source = new RTCAudioSource();
   const sendTrack = source.createTrack();
-  pc.addTransceiver(sendTrack, { direction: 'sendonly' });
+  pc.addTransceiver(sendTrack, { direction: 'sendrecv' });
   const feedCaller = makeFeeder(source, callId);
 
   // Gateway media socket (TCP — works from anywhere)
