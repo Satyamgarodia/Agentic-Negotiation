@@ -132,7 +132,9 @@ function makeFeeder(source, label) {
       // werift RTCAudioSource push API — validated by --self-test.
       for (let offset = 0; offset + 960 <= pcm48k.length; offset += 960) {
         source.onData({
-          samples: new Int16Array(pcm48k.buffer, pcm48k.byteOffset + offset, 480),
+          // onData validates the backing ArrayBuffer length, not just a typed
+          // array view. Copy each slice so it is exactly 480 samples / 960 B.
+          samples: Int16Array.from(new Int16Array(pcm48k.buffer, pcm48k.byteOffset + offset, 480)),
           sampleRate: 48000,
           bitsPerSample: 16,
           channelCount: 1,
