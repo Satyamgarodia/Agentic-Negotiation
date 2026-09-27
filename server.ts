@@ -794,8 +794,6 @@ async function processIncomingCall(opts: {
 }) {
   const { callId, caller, callerName, sdpOffer, phoneNumberId } = opts;
   const pipeStart = Date.now();
-  setStage(callId, 'pickup_started', `from ${caller} (${callerName}), sdp=${sdpOffer ? `${sdpOffer.length}B` : 'none'}`);
-
   let call = callSessions.get(callId);
   if (!call) {
     call = {
@@ -817,6 +815,9 @@ async function processIncomingCall(opts: {
   }
   // Keep the latest SDP offer for the bridge worker (never logged in full).
   if (sdpOffer) call.sdpOffer = sdpOffer;
+  // The bridge pending endpoint requires this stage in stageHistory. Record it
+  // only after the session has been created so it is not merely log output.
+  setStage(callId, 'pickup_started', `from ${caller} (${callerName}), sdp=${sdpOffer ? `${sdpOffer.length}B` : 'none'}`);
 
   // LiveKit room + Gemini Live + Meta accept are INDEPENDENT — run them
   // concurrently. Sequential cold starts were costing 40s+ of ringing
