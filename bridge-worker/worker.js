@@ -253,10 +253,16 @@ function makeFeeder(source, label) {
 
 // ---------------------------------------------------------------- one call
 const activeCalls = new Map(); // callId -> { pc, ws, cleanup }
+// Calls currently in setup (SDP answer not submitted yet). The poll interval
+// (2s) is shorter than setup time (~2.1s with the ICE wait), so a second poll
+// can otherwise start a duplicate PeerConnection for the same call — two PCs,
+// two answers, one leaked with its timers still running.
+const startingCalls = new Set();
 
 async function handleCall(job) {
   const { callId, sdpOffer, roomName } = job;
-  if (activeCalls.has(callId)) return;
+  if (activeCalls.has(callId) || startingCalls.has(callId)) return;
+  startingCalls.add(callId);
   log('info', `bridging call ${shortId(callId)} (room ${roomName})`);
   const t0 = Date.now();
 
@@ -266,13 +272,15 @@ async function handleCall(job) {
   // WhatsApp offers one audio m-line. Put both directions on the same
   // transceiver; separate recvonly/sendonly transceivers leave the source
   // track unassociated with Meta's sole negotiated m-line.
-  // NOTE: created BEFORE setRemoteDescription so it binds to Meta's m-line
-  // instead of opening a second one. The post-connected diagnostics below
-  // verify this (transceiver count, m-lines, currentDirection).
+  // Do NOT addTransceiver here: a pre-offer transceiver ends up orphaned
+  // (mid:null, currentDirection:null) while the offer spawns its own recvonly
+  // transceiver — and the SDP answer goes out a=recvonly, which is exactly
+  // Meta error 138021 (no media from business). Instead addTrack() AFTER
+  // setRemoteDescription, which attaches to Meta's offered m-line.
   const source = new RTCAudioSource();
   const sendTrack = source.createTrack();
-  const audioTransceiver = pc.addTransceiver(sendTrack, { direction: 'sendrecv' });
   const feedCaller = makeFeeder(source, callId);
+  let audioTransceiver = null;
   let geminiMsgs = 0;
   let toneTimer = null;
   let diagTimer = null;
@@ -302,8 +310,8 @@ async function handleCall(job) {
         const types = summary.reduce((acc, s) => { acc[s.type] = (acc[s.type] || 0) + 1; return acc; }, {});
         const outbound = all.find((s) => s.type === 'outbound-rtp' && ((s.kind ?? s.mediaType) === 'audio' || s.kind === undefined));
         log('info', `${shortId(callId)}: audio stats dump`, {
-          direction: audioTransceiver.direction,
-          currentDirection: audioTransceiver.currentDirection,
+          direction: audioTransceiver?.direction ?? null,
+          currentDirection: audioTransceiver?.currentDirection ?? null,
           transceivers: typeof pc.getTransceivers === 'function'
             ? pc.getTransceivers().map((t) => ({ direction: t.direction, currentDirection: t.currentDirection, mid: t.mid ?? null }))
             : null,
@@ -358,6 +366,13 @@ async function handleCall(job) {
     if (stripped.removed > 0) log('info', `${shortId(callId)}: stripped ${stripped.removed} IPv6 candidate line(s) from offer`);
     logSdpSummary(stripped.sdp, callId, 'offer');
     await pc.setRemoteDescription({ type: 'offer', sdp: stripped.sdp });
+    // Attach outbound audio to Meta's offered m-line (upgrades it
+    // recvonly->sendrecv). addTrack reuses the still-unassociated offer
+    // transceiver; addTransceiver here would open a second m-line Meta ignores.
+    pc.addTrack(sendTrack);
+    try {
+      audioTransceiver = pc.getTransceivers().find((t) => t.sender && t.sender.track === sendTrack) || null;
+    } catch { audioTransceiver = null; }
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     // Wait (bounded) for srflx gathering so the answer carries a reachable
@@ -365,6 +380,9 @@ async function handleCall(job) {
     await waitForIceGathering(pc, 2500);
     const sdpAnswer = pc.localDescription?.sdp || answer.sdp;
     logSdpSummary(sdpAnswer, callId, 'answer');
+    if (/^a=recvonly$/m.test(sdpAnswer)) {
+      log('error', `${shortId(callId)}: answer m-line is recvonly — Meta will hear nothing (expect 138021)`, {});
+    }
     await api('/api/bridge/answer', { method: 'POST', body: { callId, sdpAnswer, workerId: WORKER_ID } });
     log('info', `SDP answer submitted for ${callId} in ${Date.now() - t0}ms`);
     if (TONE_TEST) {
@@ -403,8 +421,10 @@ async function handleCall(job) {
         try { pc.close(); } catch {}
       },
     });
+    startingCalls.delete(callId);
   } catch (e) {
     log('error', `bridge setup failed ${shortId(callId)}`, { error: e?.message || String(e) });
+    startingCalls.delete(callId);
     if (toneTimer) clearInterval(toneTimer);
     if (diagTimer) clearInterval(diagTimer);
     feedCaller.stop();
@@ -414,6 +434,7 @@ async function handleCall(job) {
 }
 
 function cleanupCall(callId) {
+  startingCalls.delete(callId); // unblock retry if setup never completed
   const c = activeCalls.get(callId);
   if (!c) return;
   activeCalls.delete(callId);
