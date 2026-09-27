@@ -40,7 +40,7 @@ export default function App() {
     systemPrompt: `You are the official voice assistant for WhatsApp Business. You answer voice calls live from customers with exceptional clarity, empathy, and conciseness.
 Keep your spoken responses natural, conversational, and direct (1-3 sentences per turn). Do not use markdown, emojis, or bullet points in voice responses.
 You have access to tools for checking orders, scheduling appointments, and transferring to human agents if needed.`,
-    enabledTools: ['check_order_status', 'book_appointment', 'get_business_hours', 'escalate_to_human'],
+    enabledTools: ['check_order_status', 'book_appointment', 'get_business_hours', 'escalate_to_human', 'end_call'],
   });
 
   const [endpoints, setEndpoints] = useState<EndpointsInfo>({
@@ -487,12 +487,27 @@ You have access to tools for checking orders, scheduling appointments, and trans
                 <strong>AI is on a WhatsApp call</strong> with {liveAiCall.callerName} ({liveAiCall.callerNumber}) — audio flows WhatsApp ↔ LiveKit room ↔ Gemini, fully automatic. No action needed.
               </span>
             </div>
-            <button
-              onClick={() => setActiveTab('logs')}
-              className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs shrink-0 cursor-pointer"
-            >
-              Watch live logs
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={() => setActiveTab('logs')}
+                className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer"
+              >
+                Watch live logs
+              </button>
+              <button
+                onClick={async () => {
+                  if (!liveAiCall) return;
+                  try {
+                    await fetch(`/api/calls/${encodeURIComponent(liveAiCall.id)}/end`, { method: 'POST' });
+                  } catch (e) {
+                    console.error(e);
+                  }
+                }}
+                className="px-3 py-1.5 rounded-xl bg-red-500 hover:bg-red-400 text-slate-950 font-bold text-xs cursor-pointer"
+              >
+                End call
+              </button>
+            </div>
           </div>
         </div>
       )}

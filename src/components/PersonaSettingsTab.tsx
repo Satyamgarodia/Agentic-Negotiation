@@ -264,6 +264,11 @@ Speak with crisp technical precision, patience, and clear step-by-step guidance.
               label: 'escalate_to_human(reason)',
               desc: 'Creates an urgent priority ticket and transfers the live call to a staff member.',
             },
+            {
+              id: 'end_call',
+              label: 'end_call(reason)',
+              desc: 'Lets the AI hang up the WhatsApp call itself (via Meta Graph API) after saying goodbye.',
+            },
           ].map((tool) => {
             const enabled = formData.enabledTools.includes(tool.id);
             return (

@@ -63,7 +63,10 @@ steps:
       - '--port=8080'
       - '--cpu=1'
       - '--memory=1Gi'
-      - '--timeout=300' # max request timeout; keeps long-lived call WebSockets alive
+      - '--timeout=3600' # max request timeout; a call's media WebSocket lives as
+        # long as the call — 300s would drop calls running past 5 minutes.
+      - '--no-cpu-throttling' # keep CPU allocated during long-lived call
+        # WebSockets; throttling starves realtime audio (costs a little more).
       - '--max-instances=10'
     # No --set-env-vars: non-secret config is hardcoded in server.ts.
     # Non-secret overrides only (rarely needed):
