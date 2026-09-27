@@ -1280,7 +1280,15 @@ app.get('/api/bridge/pending', (req: Request, res: Response) => {
   const pending = [];
   for (const call of callSessions.values()) {
     if (!call.sdpOffer || call.status === 'ended') continue;
-    if (!['pickup_started', 'livekit_ready', 'waiting_bridge'].includes(call.pickupStage || '')) continue;
+    // NOTE: pickupStage is a single last-writer field shared by the parallel
+    // legs (LiveKit, Gemini, Meta accept), so testing it for equality hides
+    // the call whenever Gemini wins the race (e.g. pickupStage becomes
+    // gemini_connected before the worker polls). Use stageHistory instead:
+    // pending until the pipeline started AND no terminal bridge/accept stage
+    // has been reached yet.
+    const history = (call.stageHistory || []).map((s) => s.stage);
+    if (!history.includes('pickup_started')) continue;
+    if (history.some((s) => ['bridge_answered', 'bridge_timeout', 'meta_accepted', 'meta_failed', 'meta_skipped', 'pickup_complete', 'pickup_partial'].includes(s))) continue;
     const room = livekitRooms.get(call.id);
     pending.push({
       callId: call.id,

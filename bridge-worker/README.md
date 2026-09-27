@@ -59,8 +59,10 @@ micro GCE VM. Point `PUBLIC_IP` at that host.
 
 - `POST /api/bridge/heartbeat { workerId, publicIp }` — every 10s, tells the
   gateway a bridge is alive (stale after 45s).
-- `GET /api/bridge/pending` — calls in `pickup_started/livekit_ready/
-  waiting_bridge` with SDP offers, LiveKit room + token, media WS URL.
+- `GET /api/bridge/pending` — calls with SDP offers whose pipeline started
+  (`pickup_started` in history) and no terminal stage reached yet (excludes
+  `bridge_answered/timeout`, `meta_*`, `pickup_complete/partial`), with LiveKit
+  room + token and media WS URL.
 - `POST /api/bridge/answer { callId, sdpAnswer, workerId }` — worker's SDP
   answer; the gateway sends it to Meta as the call accept (9s timeout, then
   falls back to its own SDP).
