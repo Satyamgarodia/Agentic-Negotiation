@@ -804,74 +804,92 @@ async function processIncomingCall(opts: {
   // Keep the latest SDP offer for the bridge worker (never logged in full).
   if (sdpOffer) call.sdpOffer = sdpOffer;
 
-  // 1. LiveKit room for this call (media gateway orchestration over TCP/TLS).
+  // LiveKit room + Gemini Live + Meta accept are INDEPENDENT — run them
+  // concurrently. Sequential cold starts were costing 40s+ of ringing
+  // (LiveKit ~10s, Gemini ~12s, Meta POST ~16s). Parallel => slowest leg wins.
   setStage(callId, 'livekit_start');
-  const room = await ensureLiveKitRoom(callId, callerName);
-  if (room) {
-    call.livekitRoom = room.roomName;
-    setStage(callId, 'livekit_ready', room.roomName);
-  } else {
-    setStage(callId, 'livekit_skipped', 'continuing without room — direct Gemini bridge only', 'warn');
-  }
-
-  // 1b. Headless audio: if a UDP-capable bridge worker is alive, it terminates
-  // the WhatsApp RTP, joins the LiveKit room, and pipes audio to Gemini. Wait
-  // briefly for its SDP answer; otherwise fall back to the server SDP.
-  const worker = liveBridge();
-  let bridgeAnswer: string | null = null;
-  if (worker && sdpOffer) {
-    setStage(callId, 'waiting_bridge', `worker ${worker.id} @ ${worker.publicIp || 'unknown-ip'}`);
-    bridgeAnswer = await waitForBridgeAnswer(callId, 9000);
-    if (bridgeAnswer) {
-      setStage(callId, 'bridge_answered', `SDP answer from worker ${worker.id} (${bridgeAnswer.length}B)`);
+  const roomPromise = ensureLiveKitRoom(callId, callerName).then((room) => {
+    if (room) {
+      call.livekitRoom = room.roomName;
+      setStage(callId, 'livekit_ready', room.roomName);
     } else {
-      setStage(callId, 'bridge_timeout', 'no worker answer in 9s — falling back to server SDP', 'warn');
+      setStage(callId, 'livekit_skipped', 'continuing without room — direct Gemini bridge only', 'warn');
     }
-  } else if (sdpOffer && !worker) {
-    plog('debug', 'pickup', 'no bridge worker alive — server answers SDP directly (audio needs UDP bridge/Twilio path)', { callId });
-  }
+    return room;
+  });
 
   notifySockets({
     type: 'incoming_call_event',
     call,
     hasSdpOffer: Boolean(sdpOffer),
-    livekitRoom: room?.roomName || null,
+    livekitRoom: null, // room still creating; final name arrives with call_connected_meta
     livekitUrl: livekitConfigured ? livekitWsUrl() : null,
-    agentToken: room?.agentToken || null,
+    agentToken: null,
   });
 
   if (!gatewayConfig.autoAcceptCalls) {
     console.log(`[Pickup] autoAcceptCalls=off — call ${callId} left ringing for manual accept.`);
+    const room = await roomPromise;
     return { acceptStatus: 'manual_accept_required', roomName: room?.roomName || null };
   }
 
   // 2. DIRECT connect: Gemini Live session starts NOW — no browser click.
-  const geminiOk = await startGeminiLiveForCall(callId);
-  if (!geminiOk) {
-    setStage(callId, 'pickup_failed', 'gemini session could not start — check [gemini] logs', 'error');
-  }
+  const geminiPromise = startGeminiLiveForCall(callId);
 
-  // 3. Signaling accept toward Meta (needs token + SDP offer).
+  // 3. Signaling accept toward Meta (needs token + SDP offer). No dependency
+  // on the legs above, except the bridge path which needs the worker's answer.
   const token = gatewayConfig.metaAccessToken || process.env.META_ACCESS_TOKEN || '';
-  let acceptStatus = 'waiting_for_media_bridge';
-  if (token && sdpOffer && phoneNumberId) {
-    try {
-      acceptStatus = await acceptMetaCall(callId, phoneNumberId, sdpOffer, token, bridgeAnswer || undefined);
-      if (acceptStatus.startsWith('accepted')) {
-        call.status = 'connected';
+  const doAccept = async (answerOverride: string | null): Promise<string> => {
+    if (token && sdpOffer && phoneNumberId) {
+      try {
+        const s = await acceptMetaCall(callId, phoneNumberId, sdpOffer, token, answerOverride || undefined);
+        if (s.startsWith('accepted')) {
+          call.status = 'connected';
+        }
+        return s;
+      } catch (err: any) {
+        console.error('[Meta Cloud API] Accept failed:', err?.message || err);
+        return `exception: ${err?.message || err}`;
       }
-    } catch (err: any) {
-      console.error('[Meta Cloud API] Accept failed:', err?.message || err);
-      acceptStatus = `exception: ${err?.message || err}`;
     }
-  } else if (!token) {
-    acceptStatus = 'missing_meta_token';
-    setStage(callId, 'meta_skipped', 'META_ACCESS_TOKEN missing — Gemini is live but Meta-side still rings', 'warn');
-    console.warn('[Pickup] META_ACCESS_TOKEN missing — signaling accept skipped. Gemini session is live; add token to auto-answer Meta-side ringing.');
-  } else if (!sdpOffer) {
-    acceptStatus = 'no_sdp_offer_in_webhook';
+    if (!token) {
+      setStage(callId, 'meta_skipped', 'META_ACCESS_TOKEN missing — Gemini is live but Meta-side still rings', 'warn');
+      console.warn('[Pickup] META_ACCESS_TOKEN missing — signaling accept skipped. Gemini session is live; add token to auto-answer Meta-side ringing.');
+      return 'missing_meta_token';
+    }
     setStage(callId, 'meta_skipped', 'no SDP offer in webhook — Gemini live, media bridge/Twilio path only', 'warn');
     console.warn('[Pickup] Webhook had no SDP offer — Gemini session is live; media bridge / Twilio path can still carry audio.');
+    return 'no_sdp_offer_in_webhook';
+  };
+
+  // Headless audio: if a UDP-capable bridge worker is alive, it terminates
+  // the WhatsApp RTP, joins the LiveKit room, and pipes audio to Gemini.
+  // Room tokens must exist before the worker can act, and the Meta accept
+  // needs the worker's SDP answer — so only this path stays sequential.
+  const worker = liveBridge();
+  let acceptPromise: Promise<string>;
+  if (worker && sdpOffer) {
+    acceptPromise = (async () => {
+      await roomPromise; // tokens ready for GET /api/bridge/pending
+      setStage(callId, 'waiting_bridge', `worker ${worker.id} @ ${worker.publicIp || 'unknown-ip'}`);
+      const bridgeAnswer = await waitForBridgeAnswer(callId, 9000);
+      if (bridgeAnswer) {
+        setStage(callId, 'bridge_answered', `SDP answer from worker ${worker.id} (${bridgeAnswer.length}B)`);
+      } else {
+        setStage(callId, 'bridge_timeout', 'no worker answer in 9s — falling back to server SDP', 'warn');
+      }
+      return doAccept(bridgeAnswer);
+    })();
+  } else {
+    if (sdpOffer && !worker) {
+      plog('debug', 'pickup', 'no bridge worker alive — server answers SDP directly (audio needs UDP bridge/Twilio path)', { callId });
+    }
+    acceptPromise = doAccept(null); // fires immediately, alongside room + Gemini
+  }
+
+  const [room, geminiOk, acceptStatus] = await Promise.all([roomPromise, geminiPromise, acceptPromise]);
+  if (!geminiOk) {
+    setStage(callId, 'pickup_failed', 'gemini session could not start — check [gemini] logs', 'error');
   }
 
   notifySockets({
