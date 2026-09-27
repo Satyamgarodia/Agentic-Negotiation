@@ -214,6 +214,7 @@ function makeFeeder(source, label) {
   let fedFrames = 0;
   let feedErrors = 0;
   let enqueuedChunks = 0;
+  let droppedFrames = 0;
   // RTCAudioSource requires real-time 10ms delivery. Continuous silence keeps
   // the WhatsApp RTP stream alive between Gemini speech chunks.
   const timer = setInterval(() => {
@@ -251,10 +252,17 @@ function makeFeeder(source, label) {
         pendingPcm = pendingPcm.subarray(960);
         added++;
       }
-      // Cap at ~500ms of queued Gemini audio. Old code allowed 5s (500
-      // frames) — after any network stall the caller hears stale speech
-      // half a conversation late. Drop oldest so playback stays live.
-      if (frames.length > 50) frames.splice(0, frames.length - 50);
+      // Cap at ~3s of queued Gemini audio. Gemini delivers speech in bursts
+      // faster than realtime, so the queue legitimately holds 1-2s during a
+      // long reply — a smaller cap (e.g. 500ms) chops speech into gaps.
+      // Drop oldest past the cap so playback stays live after a real stall.
+      if (frames.length > 300) {
+        droppedFrames += frames.length - 300;
+        frames.splice(0, frames.length - 300);
+        if (droppedFrames <= 3 || droppedFrames % 100 === 0) {
+          log('warn', `${label}: dropped stale outbound frames to stay live`, { droppedFrames });
+        }
+      }
       if (firstQueued && added > 0) {
         firstQueued = false;
         log('info', `${label}: first Gemini PCM queued for caller`, { queuedFrames: frames.length });
@@ -269,7 +277,7 @@ function makeFeeder(source, label) {
     }
   };
   enqueue.stop = () => clearInterval(timer);
-  enqueue.stats = () => ({ queuedFrames: frames.length, fedFrames, feedErrors, enqueuedChunks, pendingBytes: pendingPcm.length });
+  enqueue.stats = () => ({ queuedFrames: frames.length, fedFrames, feedErrors, enqueuedChunks, droppedFrames, pendingBytes: pendingPcm.length });
   return enqueue;
 }
 
