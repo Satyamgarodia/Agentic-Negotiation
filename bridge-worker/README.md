@@ -46,7 +46,7 @@ The worker's host needs a **public IP + open UDP port** (Cloud Run cannot do
 this — that is the entire reason this worker exists).
 
 ```bash
-SERVER_URL=https://gemini-call-link-387274718809.asia-south1.run.app \
+SERVER_URL=https://gemini-call-link-387274718809.us-central1.run.app \
 WORKER_ID=prod-1 \
 PUBLIC_IP=<this host's public IP> \
 node worker.js
