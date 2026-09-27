@@ -114,27 +114,46 @@ function stripIpv6Candidates(sdp) {
   return { sdp: kept.join('\r\n'), removed: lines.length - kept.length };
 }
 
-// Bounded wait for srflx gathering so the SDP answer carries a reachable
-// public candidate instead of host-only.
-function waitForIceGathering(pc, timeoutMs = 2500) {
+// Bounded wait for a usable answer: resolve shortly after the first srflx
+// (public) candidate appears instead of waiting for full gathering, so setup
+// doesn't idle on dead interfaces. Hard cap 1s — never ship host-only.
+function waitForIceGathering(pc, timeoutMs = 1000, srflxGraceMs = 250) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise((resolve) => {
     let done = false;
+    let grace = null;
     const finish = () => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      if (grace) clearTimeout(grace);
       try {
-        if (typeof pc.removeEventListener === 'function') pc.removeEventListener('icegatheringstatechange', onChange);
+        if (typeof pc.removeEventListener === 'function') {
+          pc.removeEventListener('icegatheringstatechange', onGathering);
+          pc.removeEventListener('icecandidate', onCandidate);
+        }
       } catch {}
       resolve();
     };
-    const onChange = () => {
+    const onGathering = () => {
       if (pc.iceGatheringState === 'complete') finish();
     };
+    const onCandidate = (e) => {
+      try {
+        const c = e?.candidate?.candidate ?? (typeof e?.candidate === 'string' ? e.candidate : '');
+        if (typeof c === 'string' && c.includes(' typ srflx') && !grace && !done) {
+          grace = setTimeout(finish, srflxGraceMs);
+        }
+      } catch {}
+    };
     try {
-      if (typeof pc.addEventListener === 'function') pc.addEventListener('icegatheringstatechange', onChange);
-      else pc.onicegatheringstatechange = onChange;
+      if (typeof pc.addEventListener === 'function') {
+        pc.addEventListener('icegatheringstatechange', onGathering);
+        pc.addEventListener('icecandidate', onCandidate);
+      } else {
+        pc.onicegatheringstatechange = onGathering;
+        pc.onicecandidate = onCandidate;
+      }
     } catch { finish(); return; }
     const timer = setTimeout(finish, timeoutMs);
   });
@@ -375,9 +394,9 @@ async function handleCall(job) {
     } catch { audioTransceiver = null; }
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    // Wait (bounded) for srflx gathering so the answer carries a reachable
+    // Wait (bounded, srflx-triggered) so the answer carries a reachable
     // public candidate instead of host-only.
-    await waitForIceGathering(pc, 2500);
+    await waitForIceGathering(pc);
     const sdpAnswer = pc.localDescription?.sdp || answer.sdp;
     logSdpSummary(sdpAnswer, callId, 'answer');
     if (/^a=recvonly$/m.test(sdpAnswer)) {
@@ -529,5 +548,5 @@ if (SELF_TEST) {
   void heartbeat();
   setInterval(heartbeat, 10000);
   void pollPending();
-  setInterval(pollPending, 2000);
+  setInterval(pollPending, 500);
 }
