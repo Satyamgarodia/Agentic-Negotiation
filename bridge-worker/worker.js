@@ -195,18 +195,38 @@ async function handleCall(job) {
   const pc = new RTCPeerConnection({
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   });
-  pc.onconnectionstatechange = () => {
-    log('info', `pc state ${shortId(callId)}: ${pc.connectionState}`);
-    if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) cleanupCall(callId);
-  };
-
   // WhatsApp offers one audio m-line. Put both directions on the same
   // transceiver; separate recvonly/sendonly transceivers leave the source
   // track unassociated with Meta's sole negotiated m-line.
   const source = new RTCAudioSource();
   const sendTrack = source.createTrack();
-  pc.addTransceiver(sendTrack, { direction: 'sendrecv' });
+  const audioTransceiver = pc.addTransceiver(sendTrack, { direction: 'sendrecv' });
   const feedCaller = makeFeeder(source, callId);
+
+  let statsLogged = false;
+  pc.onconnectionstatechange = () => {
+    log('info', `pc state ${shortId(callId)}: ${pc.connectionState}`);
+    if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) {
+      cleanupCall(callId);
+      return;
+    }
+    if (pc.connectionState !== 'connected' || statsLogged) return;
+    statsLogged = true;
+    setTimeout(async () => {
+      try {
+        const stats = await pc.getStats();
+        const outbound = Array.from(stats.values()).find((s) => s.type === 'outbound-rtp' && (s.kind === 'audio' || s.mediaType === 'audio'));
+        log('info', `${shortId(callId)}: outbound audio stats`, {
+          direction: audioTransceiver.direction,
+          currentDirection: audioTransceiver.currentDirection,
+          packetsSent: outbound?.packetsSent ?? null,
+          bytesSent: outbound?.bytesSent ?? null,
+        });
+      } catch (e) {
+        log('warn', `${shortId(callId)}: could not read outbound audio stats`, { error: e?.message || String(e) });
+      }
+    }, 3000);
+  };
 
   // Gateway media socket (TCP — works from anywhere)
   const mediaWs = new WebSocket(job.callMediaWs);
