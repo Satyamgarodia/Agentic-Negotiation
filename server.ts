@@ -501,7 +501,7 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
             setStage(callId, 'gemini_connected', `${model} open in ${Date.now() - t0}ms`);
             call.geminiConnected = true;
             if (call.status === 'ringing') call.status = 'connected';
-            notifySockets({ type: 'live_status', callId, status: 'connected', message: `${model} connected and listening.`, model });
+            notifySockets({ type: 'live_status', callId, status: 'connected', message: `${model} connected and listening.`, model, origin: call.origin || 'telephony' });
             notifySockets({ type: 'call_connected_meta', callId, roomName: call.livekitRoom || `wa_${callId}`, origin: call.origin || 'telephony', model });
           },
           onmessage: (message: any) => {
@@ -512,10 +512,13 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
                   const queue = geminiAudioOutbox.get(callId) || [];
                   queue.push(part.inlineData.data);
                   geminiAudioOutbox.set(callId, queue);
-                  // Fan out to dashboard monitors + media bridges.
+                  // Fan out to dashboard monitors + media bridges. Dashboards
+                  // must ignore telephony audio (origin tag below) — the phone
+                  // call owns that audio, never the open browser tab.
                   notifySockets({
                     type: 'audio_chunk',
                     callId,
+                    origin: call.origin || 'telephony',
                     audio: part.inlineData.data,
                     mimeType: part.inlineData.mimeType || 'audio/pcm;rate=24000',
                   });
@@ -523,14 +526,14 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
                 }
                 if (part.text) {
                   call.turns.push({ speaker: 'gemini', text: part.text, timestamp: new Date().toISOString() });
-                  notifySockets({ type: 'transcript_chunk', callId, speaker: 'gemini', text: part.text });
+                  notifySockets({ type: 'transcript_chunk', callId, origin: call.origin || 'telephony', speaker: 'gemini', text: part.text });
                 }
               }
             }
             if (message.serverContent?.interrupted) {
               call.status = 'interrupted';
               call.interruptionsCount += 1;
-              notifySockets({ type: 'interrupted', callId, message: 'Gemini output halted by caller speech' });
+              notifySockets({ type: 'interrupted', callId, origin: call.origin || 'telephony', message: 'Gemini output halted by caller speech' });
               setTimeout(() => {
                 if (call.status === 'interrupted') call.status = 'connected';
               }, 800);
@@ -544,7 +547,7 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
                   text: `[Action: ${toolCall.name}] -> ${JSON.stringify(result)}`,
                   timestamp: new Date().toISOString(),
                 });
-                notifySockets({ type: 'function_executed', callId, name: toolCall.name, args: toolCall.args, result });
+                notifySockets({ type: 'function_executed', callId, origin: call.origin || 'telephony', name: toolCall.name, args: toolCall.args, result });
                 return { id: toolCall.id, name: toolCall.name, response: { result } };
               });
               try {
@@ -556,7 +559,7 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
           },
           onerror: (err: any) => {
             console.error(`[Gemini Live Error] call ${callId}:`, err?.message || err);
-            notifySockets({ type: 'live_error', callId, error: err?.message || 'Gemini Live session error' });
+            notifySockets({ type: 'live_error', callId, origin: call.origin || 'telephony', error: err?.message || 'Gemini Live session error' });
           },
           onclose: (e: any) => {
             console.log(`[Gemini Live] Session closed for call ${callId}:`, e?.reason || 'Normal close');
@@ -564,7 +567,7 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
             geminiSessions.delete(callId);
             if (call.geminiConnected) {
               call.geminiConnected = false;
-              notifySockets({ type: 'live_status', callId, status: 'disconnected', message: 'Gemini Live session disconnected' });
+              notifySockets({ type: 'live_status', callId, origin: call.origin || 'telephony', status: 'disconnected', message: 'Gemini Live session disconnected' });
             }
           },
         },

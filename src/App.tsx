@@ -155,6 +155,9 @@ You have access to tools for checking orders, scheduling appointments, and trans
           }
 
           case 'audio_chunk': {
+            // Gemini audio output. Telephony calls own their audio (phone <->
+            // bridge worker) — an open dashboard tab must NEVER play it.
+            if (data.origin === 'telephony') break;
             // Audio output from Gemini 3.8 Live
             if (isSpeakerOn && pcmPlayerRef.current) {
               setCallStatus('speaking');
@@ -166,6 +169,20 @@ You have access to tools for checking orders, scheduling appointments, and trans
           }
 
           case 'transcript_chunk': {
+            // Telephony transcripts belong to the headless banner call, not
+            // the browser mockup — route them there, keep mockup untouched.
+            if (data.origin === 'telephony') {
+              const time = new Date().toLocaleTimeString([], {
+                minute: '2-digit',
+                second: '2-digit',
+              });
+              setLiveAiCall((prev) =>
+                prev && prev.id === data.callId
+                  ? { ...prev, turns: [...(prev.turns || []), { speaker: 'gemini', text: data.text, timestamp: time }] }
+                  : prev
+              );
+              break;
+            }
             // Text caption or transcript turn from Gemini
             setTurns((prev) => {
               const last = prev[prev.length - 1];
@@ -188,6 +205,9 @@ You have access to tools for checking orders, scheduling appointments, and trans
           }
 
           case 'interrupted': {
+            // Barge-in for the browser call only — telephony interruptions
+            // must not touch the dashboard speaker or mockup status.
+            if (data.origin === 'telephony') break;
             // User interrupted Gemini (Barge-in)! Flush audio output immediately
             console.log('[App] Interrupted - clearing speaker buffer');
             pcmPlayerRef.current?.stopAndClear();
@@ -207,6 +227,7 @@ You have access to tools for checking orders, scheduling appointments, and trans
           }
 
           case 'function_executed': {
+            if (data.origin === 'telephony') break; // headless call — not the mockup's turn
             const time = new Date().toLocaleTimeString([], {
               minute: '2-digit',
               second: '2-digit',
