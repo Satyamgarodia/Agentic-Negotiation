@@ -29,7 +29,7 @@ const META_GRAPH_VERSION = 'v21.0';
 // LiveKit Cloud TURN / media-bridge host. Never 127.0.0.1.
 const MEDIA_ANNOUNCE_IP = process.env.MEDIA_ANNOUNCE_IP || '';
 const MEDIA_PORT = 3480;
-const PUBLIC_BASE_URL = (process.env.APP_URL || 'https://gemini-call-link-387274718809.asia-southeast1.run.app').replace(/\/$/, '');
+const PUBLIC_BASE_URL = (process.env.APP_URL || 'https://gemini-call-link-387274718809.asia-south1.run.app').replace(/\/$/, '');
 
 const livekitUrl = process.env.LIVEKIT_URL || 'wss://agent-negotiation-wt32uzjo.livekit.cloud';
 const livekitApiKey = process.env.LIVEKIT_API_KEY || '';
