@@ -644,10 +644,59 @@ function sendAudioToGemini(callId: string, pcm16kBase64: string) {
   }
 }
 
+// Uplink coalescing: telephony bridges deliver ~20ms frames (640B PCM16).
+// Forwarding each one as its own sendRealtimeInput = ~50 API writes/sec of
+// overhead. Coalesce to ~40ms (1280B) so Gemini gets fewer, larger writes
+// with the same audio bytes. Worker-batched 40ms+ chunks skip the wait and
+// flush immediately — no added latency on the WhatsApp path.
+const geminiInbox = new Map<string, { buf: Buffer; timer: any }>();
+const GEMINI_FLUSH_BYTES = 1280; // 40ms @ 16kHz s16le mono
+const GEMINI_FLUSH_MS = 40;
+
+function flushGeminiInbox(callId: string) {
+  const entry = geminiInbox.get(callId);
+  if (!entry || entry.buf.length === 0) return;
+  const out = entry.buf;
+  entry.buf = Buffer.alloc(0);
+  if (entry.timer) { clearTimeout(entry.timer); entry.timer = null; }
+  sendAudioToGemini(callId, out.toString('base64'));
+}
+
+function queueAudioForGemini(callId: string, pcm16: Buffer) {
+  if (pcm16.length >= GEMINI_FLUSH_BYTES) {
+    // Already a full frame (WhatsApp worker path) — send now, plus piggyback
+    // anything small that was waiting so order is preserved.
+    const pending = geminiInbox.get(callId);
+    if (pending && pending.buf.length > 0) {
+      const combined = Buffer.concat([pending.buf, pcm16]);
+      pending.buf = Buffer.alloc(0);
+      if (pending.timer) { clearTimeout(pending.timer); pending.timer = null; }
+      sendAudioToGemini(callId, combined.toString('base64'));
+    } else {
+      sendAudioToGemini(callId, pcm16.toString('base64'));
+    }
+    return;
+  }
+  let entry = geminiInbox.get(callId);
+  if (!entry) {
+    entry = { buf: Buffer.alloc(0), timer: null };
+    geminiInbox.set(callId, entry);
+  }
+  entry.buf = Buffer.concat([entry.buf, pcm16]);
+  if (entry.buf.length >= GEMINI_FLUSH_BYTES) {
+    flushGeminiInbox(callId);
+  } else if (!entry.timer) {
+    entry.timer = setTimeout(() => flushGeminiInbox(callId), GEMINI_FLUSH_MS);
+  }
+}
+
 function closeGeminiSession(callId: string) {
   const session = geminiSessions.get(callId);
   geminiSessions.delete(callId);
   geminiAudioOutbox.delete(callId);
+  const inbox = geminiInbox.get(callId);
+  if (inbox?.timer) clearTimeout(inbox.timer);
+  geminiInbox.delete(callId);
   loggedFirstAudioIn.delete(callId);
   loggedFirstAudioOut.delete(callId);
   if (session) {
@@ -1335,9 +1384,11 @@ app.post('/api/calls/:id/end', (req: Request, res: Response) => {
 });
 
 // WebSocket Server Configuration
+// perMessageDeflate off on media sockets: PCM audio is incompressible, so
+// compression only adds 5-15ms of CPU latency per message for ~no size win.
 const wssSimulator = new WebSocketServer({ noServer: true });
-const wssMediaStream = new WebSocketServer({ noServer: true });
-const wssCallMedia = new WebSocketServer({ noServer: true });
+const wssMediaStream = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+const wssCallMedia = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 const activeSimulatorClients = new Set<WebSocket>();
 
@@ -1742,11 +1793,12 @@ wssCallMedia.on('connection', async (bridgeWs: WebSocket, request: any) => {
         const payload = msg.media?.payload || msg.audio;
         if (!payload) return;
         if ((bridgeWs as any).__bridgeKind === 'twilio' || msg.event === 'media') {
-          // Twilio μ-law 8k -> PCM 16k -> Gemini.
+          // Twilio μ-law 8k -> PCM 16k -> Gemini (coalesced to ~40ms).
           const pcm16 = resampleMulawToPCM16(Buffer.from(payload, 'base64'));
-          sendAudioToGemini(cid, pcm16.toString('base64'));
+          queueAudioForGemini(cid, pcm16);
         } else {
-          sendAudioToGemini(cid, payload);
+          // WhatsApp worker path — already 40ms-batched, flushes immediately.
+          queueAudioForGemini(cid, Buffer.from(payload, 'base64'));
         }
         return;
       }
@@ -1830,10 +1882,10 @@ wssMediaStream.on('connection', async (telephonyWs: WebSocket) => {
         console.log(`[Media Stream WS] Stream started: ${streamSid} call=${callId}`);
         plog('info', 'media', `twilio stream started: ${streamSid}`, { callId });
       } else if (msg.event === 'media' && msg.media?.payload && callId) {
-        // Twilio sends payload as base64 mulaw 8000Hz
+        // Twilio sends payload as base64 mulaw 8000Hz (coalesced to ~40ms).
         const rawMulaw = Buffer.from(msg.media.payload, 'base64');
         const pcm16Buffer = resampleMulawToPCM16(rawMulaw);
-        sendAudioToGemini(callId, pcm16Buffer.toString('base64'));
+        queueAudioForGemini(callId, pcm16Buffer);
       } else if (msg.event === 'stop') {
         console.log(`[Media Stream WS] Stream stopped: ${streamSid} call=${callId}`);
         const set = callMediaBridges.get(callId);

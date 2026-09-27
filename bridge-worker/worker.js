@@ -251,7 +251,10 @@ function makeFeeder(source, label) {
         pendingPcm = pendingPcm.subarray(960);
         added++;
       }
-      if (frames.length > 500) frames.splice(0, frames.length - 500); // cap latency at 5s
+      // Cap at ~500ms of queued Gemini audio. Old code allowed 5s (500
+      // frames) — after any network stall the caller hears stale speech
+      // half a conversation late. Drop oldest so playback stays live.
+      if (frames.length > 50) frames.splice(0, frames.length - 50);
       if (firstQueued && added > 0) {
         firstQueued = false;
         log('info', `${label}: first Gemini PCM queued for caller`, { queuedFrames: frames.length });
@@ -344,17 +347,36 @@ async function handleCall(job) {
     }, 3000);
   };
 
-  // Gateway media socket (TCP — works from anywhere)
-  const mediaWs = new WebSocket(job.callMediaWs);
+  // Gateway media socket (TCP — works from anywhere).
+  // perMessageDeflate off: compression adds 5-15ms per message for
+  // incompressible PCM audio — pure latency cost, ~no size win.
+  const mediaWs = new WebSocket(job.callMediaWs, { perMessageDeflate: false });
+  try { mediaWs.on('open', () => mediaWs._socket?.setNoDelay?.(true)); } catch {}
   const wsReady = new Promise((resolve, reject) => {
     mediaWs.on('open', resolve);
     mediaWs.on('error', reject);
   });
 
-  attachSink(pc, (pcm16k) => {
+  // Uplink batching: RTCAudioSink emits ~10ms frames (~320B @16k).
+  // Sending each frame as its own JSON+base64 WS message = ~100 msgs/sec
+  // of TCP/WS framing overhead. Batch to 40ms (1280B) -> ~25 msgs/sec,
+  // same audio bytes, far less per-message latency tax. A 40ms flush timer
+  // bounds tail latency so a partial batch never sits waiting.
+  let uplinkBuf = Buffer.alloc(0);
+  let uplinkMsgs = 0;
+  const UPLINK_TARGET = 1280; // 40ms @ 16kHz s16le mono
+  const flushUplink = () => {
+    if (uplinkBuf.length === 0) return;
     if (mediaWs.readyState === WebSocket.OPEN) {
-      mediaWs.send(JSON.stringify({ type: 'caller_audio', callId, audio: pcm16k.toString('base64') }));
+      mediaWs.send(JSON.stringify({ type: 'caller_audio', callId, audio: uplinkBuf.toString('base64') }));
+      uplinkMsgs++;
     }
+    uplinkBuf = Buffer.alloc(0);
+  };
+  const uplinkTimer = setInterval(flushUplink, 40);
+  attachSink(pc, (pcm16k) => {
+    uplinkBuf = Buffer.concat([uplinkBuf, pcm16k]);
+    if (uplinkBuf.length >= UPLINK_TARGET) flushUplink();
   }, callId);
 
   mediaWs.on('message', (raw) => {
@@ -374,6 +396,7 @@ async function handleCall(job) {
   });
   mediaWs.on('close', () => {
     log('info', `media ws closed ${shortId(callId)}`);
+    clearInterval(uplinkTimer);
     cleanupCall(callId);
   });
 
@@ -423,6 +446,7 @@ async function handleCall(job) {
       try {
         log('info', `${shortId(callId)}: call counters`, {
           geminiMsgs,
+          uplinkMsgs,
           ...feedCaller.stats(),
           wsOpen: mediaWs.readyState === WebSocket.OPEN,
           pcState: pc.connectionState,
@@ -435,6 +459,7 @@ async function handleCall(job) {
       cleanup: () => {
         if (toneTimer) clearInterval(toneTimer);
         if (diagTimer) clearInterval(diagTimer);
+        clearInterval(uplinkTimer);
         feedCaller.stop();
         try { mediaWs.close(); } catch {}
         try { pc.close(); } catch {}
@@ -446,6 +471,7 @@ async function handleCall(job) {
     startingCalls.delete(callId);
     if (toneTimer) clearInterval(toneTimer);
     if (diagTimer) clearInterval(diagTimer);
+    clearInterval(uplinkTimer);
     feedCaller.stop();
     try { mediaWs.close(); } catch {}
     try { pc.close(); } catch {}
