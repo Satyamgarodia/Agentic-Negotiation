@@ -127,19 +127,41 @@ function attachSink(peerConnection, onPcm16k, label) {
 }
 
 function makeFeeder(source, label) {
-  return (pcm48k) => {
+  const frames = [];
+  let firstQueued = true;
+  let firstSent = true;
+  // RTCAudioSource requires real-time 10ms delivery. Continuous silence keeps
+  // the WhatsApp RTP stream alive between Gemini speech chunks.
+  const timer = setInterval(() => {
+    const samples = frames.shift() || new Int16Array(480);
+    try {
+      source.onData({
+        samples,
+        sampleRate: 48000,
+        bitsPerSample: 16,
+        channelCount: 1,
+        numberOfFrames: 480,
+      });
+      if (firstSent) {
+        firstSent = false;
+        log('info', `${label}: outbound RTP audio pump started`);
+      }
+    } catch (e) {
+      log('error', `${label}: RTCAudioSource feed failed`, { error: e?.message || String(e) });
+    }
+  }, 10);
+
+  const enqueue = (pcm48k) => {
     try {
       // werift RTCAudioSource push API — validated by --self-test.
       for (let offset = 0; offset + 960 <= pcm48k.length; offset += 960) {
-        source.onData({
-          // onData validates the backing ArrayBuffer length, not just a typed
-          // array view. Copy each slice so it is exactly 480 samples / 960 B.
-          samples: Int16Array.from(new Int16Array(pcm48k.buffer, pcm48k.byteOffset + offset, 480)),
-          sampleRate: 48000,
-          bitsPerSample: 16,
-          channelCount: 1,
-          numberOfFrames: 480,
-        });
+        // Copy each slice so it has exactly 480 samples / 960 B.
+        frames.push(Int16Array.from(new Int16Array(pcm48k.buffer, pcm48k.byteOffset + offset, 480)));
+      }
+      if (frames.length > 500) frames.splice(0, frames.length - 500); // cap latency at 5s
+      if (firstQueued) {
+        firstQueued = false;
+        log('info', `${label}: first Gemini PCM queued for caller`, { queuedFrames: frames.length });
       }
     } catch (e) {
       log('error', `${label}: RTCAudioSource feed failed`, {
@@ -150,6 +172,8 @@ function makeFeeder(source, label) {
       throw e;
     }
   };
+  enqueue.stop = () => clearInterval(timer);
+  return enqueue;
 }
 
 // ---------------------------------------------------------------- one call
@@ -217,12 +241,14 @@ async function handleCall(job) {
       pc,
       ws: mediaWs,
       cleanup: () => {
+        feedCaller.stop();
         try { mediaWs.close(); } catch {}
         try { pc.close(); } catch {}
       },
     });
   } catch (e) {
     log('error', `bridge setup failed ${shortId(callId)}`, { error: e?.message || String(e) });
+    feedCaller.stop();
     try { mediaWs.close(); } catch {}
     try { pc.close(); } catch {}
   }
