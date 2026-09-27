@@ -75,7 +75,7 @@ steps:
     # media-stream path (/ws/media-stream) works on Cloud Run without UDP.
 
 substitutions:
-  _REGION: asia-south1 # override per-build: gcloud builds submit --substitutions=_REGION=us-central1
+  _REGION: us-central1 # gateway must sit next to the VM + Gemini model (all us-central1); override per-build: gcloud builds submit --substitutions=_REGION=asia-south1
 
 timeout: 1200s
 
