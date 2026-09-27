@@ -90,7 +90,7 @@ let gatewayConfig: GatewayConfig = {
 Default Language: Marwari. Always speak in Marwari by default unless the customer explicitly asks for another language.
 Keep your spoken responses natural, conversational, and direct (1-3 sentences per turn). Do not use markdown, emojis, or bullet points in voice responses.
 You have access to tools for checking orders, scheduling appointments, and transferring to human agents if needed.`,
-  enabledTools: ['check_order_status', 'book_appointment', 'get_business_hours', 'escalate_to_human'],
+  enabledTools: ['check_order_status', 'book_appointment', 'get_business_hours', 'escalate_to_human', 'end_call'],
 };
 
 // Call Session Model
@@ -110,6 +110,9 @@ export interface CallSession {
   interruptionsCount: number;
   livekitRoom?: string;
   geminiConnected?: boolean;
+  // Phone Number ID this call arrived on — needed to terminate the call via
+  // Meta Graph API later. Falls back to gatewayConfig.phoneNumberId at end time.
+  phoneNumberId?: string;
   // Full SDP offer from Meta, stored so a bridge worker can answer it.
   // Never logged (length only).
   sdpOffer?: string;
@@ -414,9 +417,8 @@ function livekitWsUrl(): string {
 // Audio out: PCM 24kHz base64 -> media bridges + dashboard monitors.
 // ---------------------------------------------------------------------------
 function buildGeminiTools() {
-  return [
-    {
-      functionDeclarations: [
+  const enabled = new Set(gatewayConfig.enabledTools || []);
+  const all = [
         {
           name: 'check_order_status',
           description: 'Look up a WhatsApp order shipping status by order ID.',
@@ -443,9 +445,17 @@ function buildGeminiTools() {
             properties: { reason: { type: 'STRING' as any } },
           },
         },
-      ],
-    },
+        {
+          name: 'end_call',
+          description: 'End the WhatsApp voice call after saying goodbye. Call this when the conversation is complete, the caller says goodbye, or the request is fully resolved.',
+          parameters: {
+            type: 'OBJECT' as any,
+            properties: { reason: { type: 'STRING' as any, description: 'Short reason for ending the call' } },
+          },
+        },
   ];
+  const picked = all.filter((d) => enabled.size === 0 || enabled.has(d.name));
+  return [{ functionDeclarations: picked }];
 }
 
 function resolveToolResult(name: string, args: any) {
@@ -472,6 +482,9 @@ function resolveToolResult(name: string, args: any) {
   }
   if (name === 'escalate_to_human') {
     return { ticketCreated: true, queuePosition: 2, estimatedWaitMinutes: 3 };
+  }
+  if (name === 'end_call') {
+    return { ended: true, reason: args?.reason || 'conversation complete' };
   }
   return { status: 'ok' };
 }
@@ -504,7 +517,9 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: gatewayConfig.voiceName } },
           },
-          systemInstruction: gatewayConfig.systemPrompt,
+          systemInstruction: (gatewayConfig.enabledTools || []).includes('end_call')
+            ? `${gatewayConfig.systemPrompt}\nWhen the conversation is complete or the caller says goodbye, say a brief goodbye first and then call the end_call tool to hang up.`
+            : gatewayConfig.systemPrompt,
           tools: buildGeminiTools() as any,
         } as any,
         callbacks: {
@@ -581,6 +596,15 @@ async function startGeminiLiveForCall(callId: string): Promise<boolean> {
                 (session as any)?.sendToolResponse?.({ functionResponses: responses });
               } catch (e) {
                 console.warn('[Gemini Live] sendToolResponse failed:', e);
+              }
+              // AI asked to hang up: say goodbye first, then disconnect via Meta.
+              // The delay lets the final goodbye audio flush to the caller.
+              if (calls.some((c: any) => c.name === 'end_call')) {
+                const reason = `ai_end_call:${JSON.stringify(calls.find((c: any) => c.name === 'end_call')?.args?.reason || 'done')}`;
+                setStage(callId, 'ai_requested_hangup', reason);
+                setTimeout(() => {
+                  void endCall(callId, reason, true);
+                }, 8000);
               }
             }
           },
@@ -847,6 +871,68 @@ async function acceptMetaCall(
 }
 
 // ---------------------------------------------------------------------------
+// Meta WhatsApp Cloud API: hang up a call (signaling = HTTPS, works on
+// Cloud Run). Ringing calls use action=reject, answered calls use
+// action=terminate. Best-effort: failures are logged, never thrown — local
+// teardown always proceeds either way.
+// ---------------------------------------------------------------------------
+const NON_META_CALL_PREFIXES = ['sim_call_', 'call_', 'wa_call_', 'twilio_call_', 'sip_call_'];
+
+function isRealMetaCallId(callId: string): boolean {
+  return !NON_META_CALL_PREFIXES.some((p) => callId.startsWith(p));
+}
+
+async function terminateMetaCall(
+  callId: string,
+  opts?: { phoneNumberId?: string; ringing?: boolean },
+): Promise<string> {
+  if (!isRealMetaCallId(callId)) {
+    plog('debug', 'meta', 'skip disconnect — not a Meta telephony call id', { callId });
+    return 'skipped_non_meta_call';
+  }
+  const token = gatewayConfig.metaAccessToken || process.env.META_ACCESS_TOKEN || '';
+  const phoneNumberId = opts?.phoneNumberId || gatewayConfig.phoneNumberId;
+  if (!token) {
+    plog('warn', 'meta', 'skip disconnect — META_ACCESS_TOKEN missing', { callId });
+    return 'skipped_no_token';
+  }
+  if (!phoneNumberId) {
+    plog('warn', 'meta', 'skip disconnect — phoneNumberId missing', { callId });
+    return 'skipped_no_phone_id';
+  }
+  const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${phoneNumberId}/calls`;
+  // Try the status-appropriate action first, fall back to the other one —
+  // Meta rejects terminate-on-ringing and reject-on-answered with an error.
+  const actions = opts?.ringing ? ['reject', 'terminate'] : ['terminate', 'reject'];
+  let lastErr = '';
+  for (const action of actions) {
+    const t0 = Date.now();
+    try {
+      // NOTE: token is deliberately never logged.
+      plog('info', 'meta', `POST ${action} call`, { callId, data: { url, phoneNumberId, graphVersion: META_GRAPH_VERSION } });
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messaging_product: 'whatsapp', call_id: callId, action }),
+      });
+      const data = await res.json().catch(() => ({}));
+      const tookMs = Date.now() - t0;
+      if (res.ok && (data as any).success !== false && !(data as any).error) {
+        plog('info', 'meta', `call ${action}ed OK (HTTP ${res.status} in ${tookMs}ms)`, { callId, data });
+        return `${action}ed_via_graph_api`;
+      }
+      lastErr = (data as any)?.error?.message || JSON.stringify(data);
+      plog('warn', 'meta', `${action} failed (HTTP ${res.status}), trying fallback`, { callId, data: { error: lastErr } });
+    } catch (err: any) {
+      lastErr = err?.message || String(err);
+      plog('warn', 'meta', `${action} threw, trying fallback`, { callId, data: { error: lastErr } });
+    }
+  }
+  plog('error', 'meta', `disconnect failed: ${lastErr}`, { callId });
+  return `meta_error: ${lastErr}`;
+}
+
+// ---------------------------------------------------------------------------
 // Core pickup pipeline: register -> LiveKit room -> Gemini Live -> Meta accept
 // ---------------------------------------------------------------------------
 async function processIncomingCall(opts: {
@@ -880,6 +966,8 @@ async function processIncomingCall(opts: {
   }
   // Keep the latest SDP offer for the bridge worker (never logged in full).
   if (sdpOffer) call.sdpOffer = sdpOffer;
+  // Remember which number to hang up via Meta later.
+  call.phoneNumberId = phoneNumberId || call.phoneNumberId || gatewayConfig.phoneNumberId;
   // The bridge pending endpoint requires this stage in stageHistory. Record it
   // only after the session has been created so it is not merely log output.
   setStage(callId, 'pickup_started', `from ${caller} (${callerName}), sdp=${sdpOffer ? `${sdpOffer.length}B` : 'none'}`);
@@ -991,9 +1079,26 @@ async function processIncomingCall(opts: {
   return { acceptStatus, roomName: room?.roomName || null, geminiConnected: geminiOk };
 }
 
-function endCall(callId: string, reason = 'ended') {
+async function endCall(callId: string, reason = 'ended', disconnectMeta = true): Promise<string> {
   const call = callSessions.get(callId);
   const endedOrigin = call?.origin || 'telephony';
+  const wasRinging = call?.status === 'ringing';
+  let metaStatus = 'skipped';
+
+  // Proper Meta-side hangup FIRST (while we still hold the call record),
+  // unless this teardown was itself caused by a remote hangup event.
+  if (call && disconnectMeta) {
+    setStage(callId, 'meta_disconnecting', `reason=${reason}`);
+    metaStatus = await terminateMetaCall(callId, {
+      phoneNumberId: call.phoneNumberId || gatewayConfig.phoneNumberId,
+      ringing: wasRinging,
+    });
+    const ok = !metaStatus.startsWith('meta_error');
+    setStage(callId, ok ? 'meta_disconnected' : 'meta_disconnect_failed', metaStatus, ok ? 'info' : 'warn');
+  } else if (call) {
+    plog('debug', 'pickup', `skip Meta disconnect (reason=${reason})`, { callId });
+  }
+
   if (call) {
     const secs = Math.round((Date.now() - new Date(call.startedAt).getTime()) / 1000);
     plog('info', 'pickup', `call ended: reason=${reason}, duration≈${secs}s`, {
@@ -1021,6 +1126,7 @@ function endCall(callId: string, reason = 'ended') {
     livekitRooms.delete(callId);
   }
   notifySockets({ type: 'call_ended', callId, reason, origin: endedOrigin });
+  return metaStatus;
 }
 
 // REST API Endpoints
@@ -1160,9 +1266,10 @@ app.post('/api/whatsapp/webhook', (req: Request, res: Response) => {
   }
 
   // Remote hangup / reject / timeout -> tear down Gemini + LiveKit room.
+  // No Meta disconnect needed: the remote side already hung up.
   if (['terminate', 'terminated', 'ended', 'rejected', 'timeout', 'failed'].includes(eventType)) {
     console.log(`[WhatsApp Webhook] Call ${eventType}: ${callId}`);
-    endCall(callId, eventType);
+    void endCall(callId, eventType, false);
     res.status(200).json({ status: 'call_ended', callId });
     return;
   }
@@ -1227,6 +1334,7 @@ app.post('/api/whatsapp/simulate-call', async (req: Request, res: Response) => {
     packetsOut: 0,
     avgLatencyMs: 0,
     interruptionsCount: 0,
+    phoneNumberId: gatewayConfig.phoneNumberId,
     turns: [],
   });
 
@@ -1386,13 +1494,14 @@ app.post('/api/bridge/answer', (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// 8. End Call
-app.post('/api/calls/:id/end', (req: Request, res: Response) => {
+// 8. End Call — hangs up via Meta Graph API (terminate/reject), then tears
+// down Gemini, bridges, and the LiveKit room.
+app.post('/api/calls/:id/end', async (req: Request, res: Response) => {
   const { id } = req.params;
   const call = callSessions.get(id);
   if (call) {
-    endCall(id, 'api_end');
-    res.json({ success: true, call });
+    const metaStatus = await endCall(id, 'api_end', true);
+    res.json({ success: true, call, metaStatus });
   } else {
     res.status(404).json({ error: 'Call not found' });
   }
@@ -1485,7 +1594,10 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
               prebuiltVoiceConfig: { voiceName: voice },
             },
           },
-          systemInstruction: prompt,
+          systemInstruction: (gatewayConfig.enabledTools || []).includes('end_call')
+            ? `${prompt}\nWhen the conversation is complete or the caller says goodbye, say a brief goodbye first and then call the end_call tool to hang up.`
+            : prompt,
+          tools: buildGeminiTools() as any,
         },
         callbacks: {
           onopen: () => {
@@ -1619,6 +1731,23 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
     if (browserGeminiSession && browserGeminiSession.sendToolResponse) {
       browserGeminiSession.sendToolResponse({ functionResponses: responses });
     }
+
+    // AI asked to hang up from a browser-simulated call: let goodbye play,
+    // then disconnect via Meta (no-op for sim ids) and close the session.
+    if (activeCallId && calls.some((c: any) => c.name === 'end_call')) {
+      const endingCallId = activeCallId;
+      setTimeout(() => {
+        void endCall(endingCallId, 'ai_end_call_browser', true);
+        if (browserGeminiSession) {
+          try {
+            if (typeof browserGeminiSession.close === 'function') browserGeminiSession.close();
+            else if (browserGeminiSession.conn?.close) browserGeminiSession.conn.close();
+          } catch {}
+          browserGeminiSession = null;
+        }
+        if (activeCallId === endingCallId) activeCallId = null;
+      }, 8000);
+    }
   }
 
   clientWs.on('message', async (data: any) => {
@@ -1733,7 +1862,7 @@ wssSimulator.on('connection', async (clientWs: WebSocket) => {
         case 'end_call': {
           console.log(`[Simulator WS] Ending call: ${activeCallId}`);
           if (activeCallId) {
-            endCall(activeCallId, 'browser_end');
+            void endCall(activeCallId, 'browser_end', true);
           }
           if (browserGeminiSession) {
             try {
